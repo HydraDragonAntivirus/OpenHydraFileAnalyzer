@@ -1377,7 +1377,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         """Helper to create a titled pane for a view widget."""
         pane = QtWidgets.QGroupBox(title)
         layout = QtWidgets.QVBoxLayout(pane)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(2, 8, 2, 2)
         layout.addWidget(widget)
         return pane
 
