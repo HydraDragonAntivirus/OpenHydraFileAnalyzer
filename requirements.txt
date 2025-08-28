@@ -1,0 +1,7 @@
+lief
+lxml
+nltk
+pefile
+numpy
+capstone
+yara-x

@@ -1,0 +1,8 @@
+{
+    "dark_theme": false,
+    "file_a_path": "C:/Users/victim/Documents/GitHub/yarGen/Set-up.exe",
+    "file_b_path": "C:/Users/victim/Documents/GitHub/yarGen/Virus.Hijack_Gen.Trojan.ShellObject.fKX@aeBHSxm_7_2.vir",
+    "yara_path": "C:/Users/victim/Documents/GitHub/yarGen/korna.yar",
+    "context": 512,
+    "excluded_rules_dirs": []
+}

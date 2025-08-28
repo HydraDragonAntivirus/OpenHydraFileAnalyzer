@@ -1,0 +1,1 @@
+python ZeroTrustAntivirus.py --samples "D:\datas2\datamaliciousorder"  --out-csv "D:\results\malicious_scan.csv"

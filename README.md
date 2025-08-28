@@ -1,2 +1,4 @@
-# OpenHydraFileAnalyzer
-Analyze and generate signatures for malware by this script
+# HydraDragoAntivirus File Analyzer
+## TODO
+- Sigma rule viewer
+- Suricate rule viewer
