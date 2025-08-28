@@ -7,39 +7,63 @@ and analyzing binary files.
 
 Features:
  - Dual-pane file loading (File A / File B) for comparison.
+ - Unified Disassembly View: Side-by-side hex/ASCII dump and corresponding assembly.
+ - File Roadmap: A graphical, color-coded map of the entire file structure with zoom.
+ - Assembly Roadmap: A control-flow graph of executable sections.
+ - Function Call View: An interactive view visualizing PE file imports, DLLs, and specific functions.
  - YARA-X rule loading, scanning, and a detailed match list.
  - Advanced YARA editor with syntax highlighting, saving, and validation.
  - CAPA integration for automated capability analysis with a structured match list.
  - CAPA rule editor with syntax highlighting.
- - yarGen integration with a full GUI to generate YARA rules from samples with meaningful names.
+ - yarGen integration with a full GUI to generate YARA rules from samples.
  - ClamAV SigTool integration for inspecting and decoding signature database files.
  - Computation and highlighting of differences (diff hunks) between files.
- - Interactive HTML-based hex panes with configurable bytes per row and grouping.
  - Light and Dark theme support.
  - Byte-level editing via a dialog or direct input controls.
- - Capstone-powered disassembly panes that update automatically after edits.
- - Navigation controls to jump between YARA matches.
+ - Capstone-powered disassembly that updates automatically after edits.
  - Session persistence (saves last used file paths and settings).
  - DetectItEasy integration for packer/compiler identification.
- - Pefile-based feature extractor for detailed PE analysis, including GUI check.
+ - Pefile-based feature extractor for detailed PE analysis.
  - Resource Viewer to inspect PE resources in a tree structure.
- - ML-ready YARA Rule Generator to create rules from extracted features.
+ - Unicorn Engine-based emulator for unpacking and analyzing packed files.
 """
 
 import sys
 import os
-import threading
 import subprocess
 import logging
 import binascii
 import json
 import re
 import hashlib
+import base64
+import math
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
+import struct
+import lzma
+from dataclasses import dataclass
+import tempfile
+import time
+
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtGui import QSyntaxHighlighter, QTextCharFormat, QColor, QFont
+from PySide6.QtCore import Qt, QPointF, QThreadPool, QRunnable, Slot, Signal, QObject
+from PySide6.QtGui import QSyntaxHighlighter, QTextCharFormat, QColor, QFont, QPainter, QPen, QBrush, QPainterPath, QPolygonF
+from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem, QGraphicsItem, QGraphicsPathItem, QGraphicsLineItem, QTableWidgetItem
+
+# PE file format constants for VMProtect unpacking
+IMAGE_DOS_SIGNATURE = 0x5A4D  # MZ
+IMAGE_NT_SIGNATURE = 0x00004550  # PE\0\0
+IMAGE_SIZEOF_SHORT_NAME = 8
+IMAGE_SCN_CNT_UNINITIALIZED_DATA = 0x00000080
+LZMA_PROPERTIES_SIZE = 5  # Standard LZMA properties size
+
+@dataclass
+class PACKER_INFO:
+    """VMProtect packer info structure"""
+    Src: int  # uint32
+    Dst: int  # uint32
 
 # --- Dependency Checks and Imports ---
 
@@ -51,7 +75,7 @@ except ImportError:
     YARA_AVAILABLE = False
 
 try:
-    from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64, CS_GRP_JUMP, CS_GRP_CALL, CS_GRP_RET, CS_OP_IMM
     CAPSTONE_AVAILABLE = True
 except ImportError:
     CAPSTONE_AVAILABLE = False
@@ -70,6 +94,13 @@ except ImportError:
     np = None
     NUMPY_AVAILABLE = False
 
+try:
+    # Import Unicorn Engine constants
+    from unicorn import *
+    from unicorn.x86_const import *
+    UNICORN_AVAILABLE = True
+except ImportError:
+    UNICORN_AVAILABLE = False
 
 # --- Constants and Configuration ---
 
@@ -84,7 +115,6 @@ MAX_CONTEXT_SIZE = 65536
 
 # --- Default Paths (relative to script) ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
-# Corrected CAPA rules directory to match user's setup
 capa_rules_dir = os.path.join(script_dir, "capa-rules")
 capa_results_dir = os.path.join(script_dir, "capa_results")
 excluded_rules_dir = os.path.join(script_dir, "excluded-rules")
@@ -92,6 +122,89 @@ excluded_rules_dir = os.path.join(script_dir, "excluded-rules")
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Worker Thread for Background Tasks ---
+
+class WorkerSignals(QObject):
+    '''
+    Defines the signals available from a running worker thread.
+    Supported signals are:
+    finished
+        No data
+    error
+        `tuple` (exctype, value, traceback.format_exc())
+    result
+        `object` data returned from processing, anything
+    progress
+        `int` indicating % progress
+    '''
+    finished = Signal()
+    error = Signal(tuple)
+    result = Signal(object)
+    progress = Signal(int)
+    console_output = Signal(str)
+
+class Worker(QRunnable):
+    '''
+    Worker thread
+    Inherits from QRunnable to handler worker thread setup, signals and wrap-up.
+    :param callback: The function callback to run on this worker thread. Supplied args and
+                     kwargs will be passed through to the runner.
+    :type callback: function
+    :param args: Arguments to pass to the callback function
+    :param kwargs: Keywords to pass to the callback function
+    '''
+
+    def __init__(self, fn, *args, **kwargs):
+        super(Worker, self).__init__()
+        # Store constructor arguments (re-used for thread pooling)
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+        # Add the callback to our kwargs
+        if 'progress_callback' not in self.kwargs:
+            self.kwargs['progress_callback'] = self.signals.progress
+        if 'console_output_callback' not in self.kwargs:
+            self.kwargs['console_output_callback'] = self.signals.console_output
+
+
+    @Slot()
+    def run(self):
+        '''
+        Initialise the runner function with passed args, kwargs.
+        '''
+        # Retrieve args/kwargs here; and fire processing using them
+        try:
+            result = self.fn(*self.args, **self.kwargs)
+        except:
+            import traceback
+            traceback.print_exc()
+            exctype, value = sys.exc_info()[:2]
+            self.signals.error.emit((exctype, value, traceback.format_exc()))
+        else:
+            self.signals.result.emit(result)  # Return the result of the processing
+        finally:
+            self.signals.finished.emit()  # Done
+
+# --- Custom Zoomable Graphics View ---
+class ZoomableView(QGraphicsView):
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+
+    def wheelEvent(self, event):
+        zoom_in_factor = 1.25
+        zoom_out_factor = 1 / zoom_in_factor
+
+        if event.angleDelta().y() > 0:
+            self.scale(zoom_in_factor, zoom_in_factor)
+        else:
+            self.scale(zoom_out_factor, zoom_out_factor)
 
 # --- Syntax Highlighting Classes ---
 
@@ -232,9 +345,9 @@ class PEFeatureExtractor:
         if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
             for entry in pe.DIRECTORY_ENTRY_IMPORT:
                 dll_imports = {
-                    'dll_name': entry.dll.decode() if entry.dll else None,
+                    'dll_name': entry.dll.decode() if entry.dll else "Unknown DLL",
                     'imports': [{
-                        'name': imp.name.decode() if imp.name else None,
+                        'name': imp.name.decode(errors='ignore') if imp.name else f"Ordinal {imp.ordinal}",
                         'address': imp.address,
                         'ordinal': imp.ordinal
                     } for imp in entry.imports]
@@ -248,10 +361,10 @@ class PEFeatureExtractor:
         if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
             for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
                 export_info = {
-                    'name': exp.name.decode() if exp.name else None,
+                    'name': exp.name.decode(errors='ignore') if exp.name else f"Ordinal {exp.ordinal}",
                     'address': exp.address,
                     'ordinal': exp.ordinal,
-                    'forwarder': exp.forwarder.decode() if exp.forwarder else None
+                    'forwarder': exp.forwarder.decode(errors='ignore') if exp.forwarder else None
                 }
                 exports.append(export_info)
         return exports
@@ -624,13 +737,15 @@ class PEFeatureExtractor:
         """
         Extract numeric features of a file using pefile.
         """
+        if file_path in self.features_cache:
+            return self.features_cache[file_path]
+            
         try:
             # Load the PE file
-            pe = pefile.PE(file_path)
+            pe = pefile.PE(file_path, fast_load=True)
 
             # Extract features
             numeric_features = {
-                # Optional Header Features
                 'SizeOfOptionalHeader': pe.FILE_HEADER.SizeOfOptionalHeader,
                 'MajorLinkerVersion': pe.OPTIONAL_HEADER.MajorLinkerVersion,
                 'MinorLinkerVersion': pe.OPTIONAL_HEADER.MinorLinkerVersion,
@@ -660,34 +775,9 @@ class PEFeatureExtractor:
                 'SizeOfHeapCommit': pe.OPTIONAL_HEADER.SizeOfHeapCommit,
                 'LoaderFlags': pe.OPTIONAL_HEADER.LoaderFlags,
                 'NumberOfRvaAndSizes': pe.OPTIONAL_HEADER.NumberOfRvaAndSizes,
-
-                # Section Headers
-                'sections': [
-                    {
-                        'name': section.Name.decode(errors='ignore').strip('\x00'),
-                        'virtual_size': section.Misc_VirtualSize,
-                        'virtual_address': section.VirtualAddress,
-                        'size_of_raw_data': section.SizeOfRawData,
-                        'pointer_to_raw_data': section.PointerToRawData,
-                        'characteristics': section.Characteristics,
-                    }
-                    for section in pe.sections
-                ],
-
-                # Imported Functions
-                'imports': [
-                    imp.name.decode(errors='ignore') if imp.name else "Unknown"
-                    for entry in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', [])
-                    for imp in getattr(entry, 'imports', [])
-                ] if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT') else [],
-
-                # Exported Functions
-                'exports': [
-                    exp.name.decode(errors='ignore') if exp.name else "Unknown"
-                    for exp in getattr(getattr(pe, 'DIRECTORY_ENTRY_EXPORT', None), 'symbols', [])
-                ] if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT') else [],
-
-                # Resources
+                'sections': [self.extract_section_data(s) for s in pe.sections],
+                'imports': self.extract_imports(pe),
+                'exports': self.extract_exports(pe),
                 'resources': [
                     {
                         'type_id': getattr(getattr(resource_type, 'struct', None), 'Id', None),
@@ -697,13 +787,11 @@ class PEFeatureExtractor:
                         'codepage': getattr(getattr(resource_lang, 'data', None), 'CodePage', None),
                     }
                     for resource_type in
-                    (pe.DIRECTORY_ENTRY_RESOURCE.entries if hasattr(pe.DIRECTORY_ENTRY_RESOURCE, 'entries') else [])
+                    (pe.DIRECTORY_ENTRY_RESOURCE.entries if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE') and hasattr(pe.DIRECTORY_ENTRY_RESOURCE, 'entries') else [])
                     for resource_id in (resource_type.directory.entries if hasattr(resource_type, 'directory') else [])
                     for resource_lang in (resource_id.directory.entries if hasattr(resource_id, 'directory') else [])
                     if hasattr(resource_lang, 'data')
-                ] if hasattr(pe, 'DIRECTORY_ENTRY_RESOURCE') else [],
-
-                # Debug Information
+                ],
                 'debug': [
                     {
                         'type': debug.struct.Type,
@@ -712,52 +800,1278 @@ class PEFeatureExtractor:
                         'size': debug.struct.SizeOfData,
                     }
                     for debug in getattr(pe, 'DIRECTORY_ENTRY_DEBUG', [])
-                ] if hasattr(pe, 'DIRECTORY_ENTRY_DEBUG') else [],
-
-                # Certificates
-                'certificates': self.analyze_certificates(pe),  # Analyze certificates
-
-                # DOS Stub Analysis
-                'dos_stub': self.analyze_dos_stub(pe),  # DOS stub analysis here
-
-                # TLS Callbacks
-                'tls_callbacks': self.analyze_tls_callbacks(pe),  # TLS callback analysis here
-
-                # Delay Imports
-                'delay_imports': self.analyze_delay_imports(pe),  # Delay imports analysis here
-
-                # Load Config
-                'load_config': self.analyze_load_config(pe),  # Load config analysis here
-
-                # Bound Imports
-                'bound_imports': self.analyze_bound_imports(pe),  # Bound imports analysis here
-
-                # Section Characteristics
+                ],
+                'certificates': self.analyze_certificates(pe),
+                'dos_stub': self.analyze_dos_stub(pe),
+                'tls_callbacks': self.analyze_tls_callbacks(pe),
+                'delay_imports': self.analyze_delay_imports(pe),
+                'load_config': self.analyze_load_config(pe),
+                'bound_imports': self.analyze_bound_imports(pe),
                 'section_characteristics': self.analyze_section_characteristics(pe),
-                # Section characteristics analysis here
-
-                # Extended Headers
-                'extended_headers': self.analyze_extended_headers(pe),  # Extended headers analysis here
-
-                # Rich Header
-                'rich_header': self.analyze_rich_header(pe),  # Rich header analysis here
-
-                # Overlay
-                'overlay': self.analyze_overlay(pe, file_path),  # Overlay analysis here
-                
-                #Relocations
-                'relocations': self.analyze_relocations(pe) #Relocations analysis here
+                'extended_headers': self.analyze_extended_headers(pe),
+                'rich_header': self.analyze_rich_header(pe),
+                'overlay': self.analyze_overlay(pe, file_path),
+                'relocations': self.analyze_relocations(pe)
             }
 
-            # Add numeric tag if provided
             if rank is not None:
                 numeric_features['numeric_tag'] = rank
-
+            
+            self.features_cache[file_path] = numeric_features
             return numeric_features
 
         except Exception as ex:
             logging.error(f"Error extracting numeric features from {file_path}: {str(ex)}", exc_info=True)
+            return {'error': str(ex)}
+
+class EnhancedUnicornUnpacker:
+    def __init__(self, file_path, console_output_callback=None):
+        self.file_path = file_path
+        self.console_output = console_output_callback
+        self.pe = None
+        self.mu = None
+        self.oep = None
+        self.initial_sections_info = {}
+        self.vmprotect_data = None
+        self.instruction_count = 0
+        self.max_instructions_before_check = 5000  # More frequent checks
+        self.unpacker_sections = set()
+        self.original_entry_point = None
+        self.execution_history = []
+        self.potential_oeps = []
+        self.page_log_interval = 0x1000   # throttle per page
+        self.logged_pages = set()
+        # Stall detection
+        self.last_progress_time = time.time()
+        self.last_instruction_count = 0
+        self.stall_timeout = 10 # seconds
+        self.page_fault_count = 0
+        self.max_page_faults = 500 # Limit to prevent infinite mapping
+        # Packer-specific flags
+        self.is_upx_packed = False
+
+
+    def log(self, message: str):
+        logging.info(message)
+        if self.console_output:
+            try:
+                # Support both Qt signals and simple callables
+                emit = getattr(self.console_output, 'emit', None)
+                if callable(emit):
+                    emit(message)
+                elif callable(self.console_output):
+                    self.console_output(message)
+            except Exception:
+                pass
+
+    def to_hex_string(self, val, prefix=True):
+        return f"0x{val:x}" if prefix else f"{val:x}"
+
+    def dump_executed_pages(self, out_dir):
+        """Dump memory pages that were executed (from logged_pages) to files for offline analysis."""
+        if not self.mu:
+            self.log("[Dump] No emulator instance available")
+            return
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        for page in sorted(self.logged_pages):
+            try:
+                data = self.mu.mem_read(page, 0x1000)
+                fname = os.path.join(out_dir, f"page_{page:08x}.bin")
+                with open(fname, "wb") as f:
+                    f.write(data)
+                self.log(f"[Dump] Wrote page 0x{page:x} to {fname}")
+            except Exception as e:
+                self.log(f"[Dump] Failed to dump page 0x{page:x}: {e}")
+
+    def find_pattern(self, data: bytes, pattern: bytes) -> Optional[int]:
+        """
+        Find pattern in data, supporting 0xFF as wildcard
+        Returns position where found, or None if not found
+        """
+        if not pattern or len(data) < len(pattern):
             return None
+
+        for i in range(len(data) - len(pattern) + 1):
+            match = True
+            for j in range(len(pattern)):
+                if pattern[j] != 0xFF and data[i + j] != pattern[j]:
+                    match = False
+                    break
+            if match:
+                return i
+        return None
+
+    def _parse_lzma_props(self, lzma_props_data):
+        """Return (lc, lp, pb, dict_size) or None if invalid."""
+        if not lzma_props_data or len(lzma_props_data) < 5:
+            return None
+        first = lzma_props_data[0]
+        if first > 224:
+            return None
+        lc = first % 9
+        lp = (first // 9) % 5
+        pb = first // 45
+        dict_size = int.from_bytes(lzma_props_data[1:5], 'little')
+        # Keep dict size sane (4KB..64MB)
+        if dict_size < 4096 or dict_size > 0x4000000:  # 64MB cap
+            return None
+        return lc, lp, pb, dict_size
+
+    def _sync_to_lzma_stream(self, blob: bytes, lc: int, lp: int, pb: int, dict_size: int,
+                            max_lookahead: int = 0x4000, test_bytes: int = 4096):
+        """
+        Try to locate the start of a valid raw LZMA stream within the first max_lookahead bytes.
+        Returns (offset, 'LZMA1'|'LZMA2') or (None, None).
+        Treats 'Already at end of stream' as a benign probe result (some streams are short).
+        """
+        limit = min(len(blob), max_lookahead)
+        for off in range(0, limit):
+            window = blob[off: off + test_bytes]
+            if not window:
+                break
+
+            # LZMA1 probe
+            try:
+                d = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[{
+                    "id": lzma.FILTER_LZMA1, "dict_size": dict_size, "lc": lc, "lp": lp, "pb": pb
+                }])
+                _ = d.decompress(window)
+                return off, 'LZMA1'
+            except lzma.LZMAError as e:
+                # treat "Already at end of stream" as a valid probe (short stream)
+                if 'Already at end of stream' in str(e):
+                    return off, 'LZMA1'
+                pass
+
+            # LZMA2 probe
+            try:
+                d = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[{
+                    "id": lzma.FILTER_LZMA2, "dict_size": dict_size
+                }])
+                _ = d.decompress(window)
+                return off, 'LZMA2'
+            except lzma.LZMAError as e:
+                if 'Already at end of stream' in str(e):
+                    return off, 'LZMA2'
+                pass
+
+        return None, None
+
+    def extract_vmprotect_data(self, pe_data: bytes):
+        """Enhanced VMProtect LZMA compressed data extraction with better error handling"""
+        if pefile is None:
+            self.log("[VMProtect] pefile module not available")
+            return None
+
+        try:
+            pe = pefile.PE(data=pe_data)
+        except pefile.PEFormatError as e:
+            self.log(f"[VMProtect] Invalid PE file format: {str(e)}")
+            return None
+
+        is_64bit = pe.FILE_HEADER.Machine == 0x8664
+
+        vmprotect_sections = []
+        for section in pe.sections:
+            sec_name = section.Name.decode(errors='ignore').strip('\x00')
+            if any(vmp_name in sec_name.lower() for vmp_name in ['.vmp', '.text', '.data', '.rdata']):
+                vmprotect_sections.append(section)
+
+        self.log(f"[VMProtect] Found {len(vmprotect_sections)} potential VMProtect sections")
+
+        rva_patterns_array = []
+        valid_sections = []
+
+        for section in pe.sections:
+            condition1 = (section.SizeOfRawData == 0)
+            condition2 = (section.PointerToRawData == 0)
+            condition3 = not (section.Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA)
+            condition4 = (section.VirtualAddress > 0 and section.Misc_VirtualSize > 0)
+
+            if condition1 and condition2 and condition3 and condition4:
+                valid_sections.append(section)
+                if is_64bit:
+                    pattern_value = ((section.VirtualAddress << 32) | 0xFFFFFFFF) & 0xFFFFFFFFFFFFFFFF
+                    pattern_bytes = struct.pack("<Q", pattern_value)
+                else:
+                    pattern_bytes = struct.pack("<I", section.VirtualAddress) + b'\xFF\xFF\xFF\xFF'
+                rva_patterns_array.append(pattern_bytes)
+
+        if not rva_patterns_array:
+            self.log("[VMProtect] No VMProtect RVA patterns found")
+            return None
+
+        self.log(f"[VMProtect] Found {len(rva_patterns_array)} RVA patterns from {len(valid_sections)} sections")
+
+        pattern_bytes = b''.join(rva_patterns_array)
+        pattern_pos = self.find_pattern(pe_data, pattern_bytes)
+
+        if pattern_pos is not None:
+            if pattern_pos < 8:
+                self.log("[VMProtect] Located RVA pattern is too close to the beginning")
+                return None
+
+            packer_info_offset = pattern_pos - 8
+            num_packer_entries = len(rva_patterns_array)
+            required_size = (num_packer_entries + 1) * 8
+            if packer_info_offset + required_size > len(pe_data):
+                self.log(f"[VMProtect] PACKER_INFO array extends beyond file (need {required_size} bytes, have {len(pe_data) - packer_info_offset})")
+                return None
+
+            packer_info_array = []
+            for j in range(num_packer_entries + 1):
+                info_offset = packer_info_offset + j * 8
+                src = struct.unpack("<I", pe_data[info_offset:info_offset+4])[0]
+                dst = struct.unpack("<I", pe_data[info_offset+4:info_offset+8])[0]
+                packer_info_array.append(PACKER_INFO(src, dst))
+
+            self.log(f"[VMProtect] Found {len(packer_info_array)} PACKER_INFO entries ({'64-bit' if is_64bit else '32-bit'} PE)")
+
+            return {
+                'pe': pe,
+                'packer_info': packer_info_array,
+                'pe_data': pe_data,
+                'is_64bit': is_64bit,
+                'packer_info_offset': packer_info_offset
+            }
+
+        return None
+
+    def debug_vmprotect_structure(self, vmprotect_data) -> bool:
+        """Debug VMProtect structure to understand why LZMA extraction fails
+        Returns True if it made a correction to packer_info (partial properties), False otherwise.
+        """
+        if not vmprotect_data:
+            return False
+
+        pe = vmprotect_data['pe']
+        packer_info_array = vmprotect_data['packer_info']
+        pe_data = vmprotect_data['pe_data']
+
+        self.log("[VMProtect Debug] Analyzing PACKER_INFO structure:")
+
+        for i, info in enumerate(packer_info_array):
+            self.log(f"  Entry {i}: Src=0x{info.Src:x}, Dst=0x{info.Dst:x}")
+
+            if i == 0:  # Properties entry
+                try:
+                    props_offset = pe.get_offset_from_rva(info.Src)
+                    self.log(f"    Properties offset: 0x{props_offset:x}")
+                    self.log(f"    Properties size: {info.Dst}")
+                    self.log(f"    File size: {len(pe_data)}")
+
+                    if props_offset + info.Dst <= len(pe_data):
+                        props_data = pe_data[props_offset:props_offset + min(16, info.Dst)]
+                        self.log(f"    Properties data (first 16 bytes): {props_data.hex()}")
+                    else:
+                        self.log(f"    Properties extend beyond file by {(props_offset + info.Dst) - len(pe_data)} bytes")
+
+                        if props_offset < len(pe_data):
+                            available_size = len(pe_data) - props_offset
+                            props_data = pe_data[props_offset:props_offset + available_size]
+                            self.log(f"    Available properties data ({available_size} bytes): {props_data.hex()}")
+
+                            if available_size >= 5:
+                                self.log("    Attempting to use partial properties data...")
+                                corrected_info = PACKER_INFO(info.Src, available_size)
+                                vmprotect_data['packer_info'][0] = corrected_info
+                                return True
+
+                except Exception as e:
+                    self.log(f"    Error accessing properties: {str(e)}")
+            else:  # Data blocks
+                try:
+                    block_offset = pe.get_offset_from_rva(info.Src)
+                    self.log(f"    Block {i} offset: 0x{block_offset:x}, target RVA: 0x{info.Dst:x}")
+
+                    if block_offset < len(pe_data):
+                        sample_size = min(16, len(pe_data) - block_offset)
+                        sample_data = pe_data[block_offset:block_offset + sample_size]
+                        self.log(f"    Block {i} data sample: {sample_data.hex()}")
+                    else:
+                        self.log(f"    Block {i} offset beyond file")
+
+                except Exception as e:
+                    self.log(f"    Error accessing block {i}: {str(e)}")
+
+        return False  # No correction made
+
+    def _find_lzma_props_by_scan(self, pe, pe_data, hint_offset=None, search_range=0x2000):
+        """
+        Search pe_data for plausible LZMA props (5 bytes). Returns (props_rva, props_size) or (None, None).
+        LZMA props: 1 byte (lc/lp/pb) where <=224, followed by 4-byte little-endian dict size.
+        If hint_offset is given, search nearby first, then whole file (bounded by search_range).
+        """
+        file_len = len(pe_data)
+        candidates = []
+
+        def check_offset(o):
+            if o + 5 > file_len:
+                return False
+            first = pe_data[o]
+            if first > 224:
+                return False
+            dict_size = int.from_bytes(pe_data[o+1:o+5], 'little')
+            if dict_size < 4096 or dict_size > 0x4000000:  # cap at 64MB
+                return False
+            return True
+
+        if hint_offset is not None:
+            start = max(0, hint_offset - search_range)
+            end = min(file_len - 5, hint_offset + search_range)
+            for o in range(start, end):
+                if check_offset(o):
+                    candidates.append(o)
+
+        if not candidates:
+            max_scan = min(file_len - 5, 5 * 1024 * 1024)  # scan up to first 5MB
+            for o in range(0, max_scan):
+                if check_offset(o):
+                    candidates.append(o)
+                    break
+
+        for raw_off in candidates:
+            try:
+                rva = pe.get_rva_from_offset(raw_off)
+                return (rva, int.from_bytes(pe_data[raw_off+1:raw_off+5], 'little'))
+            except Exception:
+                return (None, int.from_bytes(pe_data[raw_off+1:raw_off+5], 'little'))
+
+        return (None, None)
+
+    def decompress_vmprotect_lzma(self, vmprotect_data) -> Optional[Dict[int, bytes]]:
+        """Decompress VMProtect LZMA blocks into {rva: data} dict (returns None on failure)."""
+        if not vmprotect_data or len(vmprotect_data.get('packer_info', [])) <= 1:
+            self.log("[VMProtect] Insufficient packer_info for LZMA decompression.")
+            return None
+
+        pe = vmprotect_data['pe']
+        packer_info_array = vmprotect_data['packer_info']
+        pe_data = vmprotect_data['pe_data']
+
+        props_info = packer_info_array[0]
+        try:
+            props_raw_offset = pe.get_offset_from_rva(props_info.Src)
+        except Exception:
+            self.log(f"[VMProtect] Cannot get properties offset for RVA {self.to_hex_string(props_info.Src)}. Scanning for properties...")
+            hint = vmprotect_data.get('packer_info_offset', None)
+            found_rva, _ = self._find_lzma_props_by_scan(pe, pe_data, hint_offset=hint)
+            if found_rva is None:
+                self.log("[VMProtect] Scan for LZMA properties failed. Cannot decompress.")
+                return None
+            
+            try:
+                props_raw_offset = pe.get_offset_from_rva(found_rva)
+                dict_size = int.from_bytes(pe_data[props_raw_offset+1:props_raw_offset+5], 'little')
+                props_info = PACKER_INFO(found_rva, dict_size)
+                vmprotect_data['packer_info'][0] = props_info # Correct the info for later use
+                self.log(f"[VMProtect] Found fallback properties at RVA 0x{found_rva:x}")
+            except Exception:
+                 self.log("[VMProtect] Cannot use fallback properties. Decompression aborted.")
+                 return None
+
+        lzma_props_size = 5
+        if props_raw_offset < 0 or props_raw_offset + lzma_props_size > len(pe_data):
+            self.log(f"[VMProtect] Properties offset/size invalid (offset={props_raw_offset}, size={lzma_props_size})")
+            return None
+
+        lzma_props_data = pe_data[props_raw_offset:props_raw_offset + lzma_props_size]
+        parsed = self._parse_lzma_props(lzma_props_data)
+        if not parsed:
+            self.log("[VMProtect] LZMA properties invalid after sanity checks.")
+            return None
+
+        lc, lp, pb, dict_size = parsed
+        self.log(f"[VMProtect] LZMA props: lc={lc}, lp={lp}, pb={pb}, dict_size=0x{dict_size:x}")
+        decompressed_sections: Dict[int, bytes] = {}
+
+        total_blocks = len(packer_info_array) - 1
+        for block_idx in range(1, len(packer_info_array)):
+            # Log progress to keep the user informed
+            if block_idx % 5 == 0 or total_blocks < 10:
+                 self.log(f"[VMProtect] Decompressing block {block_idx}/{total_blocks}...")
+
+            current_block_info = packer_info_array[block_idx]
+            compressed_data_rva = current_block_info.Src
+            uncompressed_target_rva = current_block_info.Dst
+
+            if compressed_data_rva == 0 or uncompressed_target_rva == 0:
+                self.log(f"[VMProtect] Block {block_idx}: Skipping invalid block (Src or Dst is zero).")
+                continue
+
+            try:
+                compressed_block_raw_offset = pe.get_offset_from_rva(compressed_data_rva)
+            except Exception:
+                self.log(f"[VMProtect] Block {block_idx}: Cannot convert RVA {self.to_hex_string(compressed_data_rva)} to offset. Skipping.")
+                continue
+
+            if compressed_block_raw_offset >= len(pe_data):
+                self.log(f"[VMProtect] Block {block_idx}: Compressed data offset {compressed_block_raw_offset} is beyond file size. Skipping.")
+                continue
+
+            max_compressed_size = min(0x2000000, len(pe_data) - compressed_block_raw_offset)
+            compressed_data = pe_data[compressed_block_raw_offset : compressed_block_raw_offset + max_compressed_size]
+
+            if len(compressed_data) < 10:
+                self.log(f"[VMProtect] Block {block_idx}: Compressed data too small ({len(compressed_data)} bytes). Skipping.")
+                continue
+
+            start_off, kind = self._sync_to_lzma_stream(compressed_data, lc, lp, pb, dict_size)
+            if start_off is None:
+                self.log(f"[VMProtect] Block {block_idx}: Could not sync to a valid LZMA stream. Skipping.")
+                continue
+            
+            stream_data = compressed_data[start_off:]
+            
+            # --- Chunked Decompression to prevent freezing ---
+            try:
+                filters: List[Dict[str, Any]]
+                if kind == 'LZMA1':
+                    filters = [{"id": lzma.FILTER_LZMA1, "dict_size": dict_size, "lc": lc, "lp": lp, "pb": pb}]
+                else: # LZMA2
+                    filters = [{"id": lzma.FILTER_LZMA2, "dict_size": dict_size}]
+
+                decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
+                
+                output_chunks = []
+                total_decompressed_size = 0
+                max_output_size = 0x4000000 # 64MB limit per block
+                input_chunk_size = 65536  # Process 64KB of compressed data at a time
+
+                for i in range(0, len(stream_data), input_chunk_size):
+                    chunk = stream_data[i:i + input_chunk_size]
+                    if not chunk:
+                        break
+                    
+                    try:
+                        decompressed_chunk = decompressor.decompress(chunk, max_length=max_output_size - total_decompressed_size)
+                        if decompressed_chunk:
+                            output_chunks.append(decompressed_chunk)
+                            total_decompressed_size += len(decompressed_chunk)
+                        
+                        if total_decompressed_size >= max_output_size:
+                            self.log(f"[VMProtect] Block {block_idx}: Decompression output limit reached.")
+                            break
+                    except lzma.LZMAError as e:
+                        if "end of stream" in str(e).lower():
+                            break # This is an expected way to finish
+                        else:
+                            self.log(f"[VMProtect] Block {block_idx}: LZMA error during chunked decompression: {e}")
+                            output_chunks = [] # Invalidate partial data on real error
+                            break
+                
+                if output_chunks:
+                    decompressed_data = b"".join(output_chunks)
+                    decompressed_sections[uncompressed_target_rva] = decompressed_data
+                else:
+                    # This is not an error, some blocks might be empty
+                    pass
+
+            except MemoryError:
+                self.log(f"[VMProtect] Block {block_idx}: Out of memory during decompression. Skipping.")
+            except Exception as e:
+                self.log(f"[VMProtect] Block {block_idx}: Unexpected error during chunked decompression: {repr(e)}")
+
+        if decompressed_sections:
+            self.log(f"[VMProtect] Successfully decompressed {len(decompressed_sections)} sections.")
+        else:
+            self.log("[VMProtect] Decompression finished, but no sections were recovered.")
+
+        return decompressed_sections
+
+    def analyze_instruction(self, address, data):
+        """Analyze instruction to detect potential OEP patterns"""
+        try:
+            if len(data) >= 2:
+                if data[0] in [0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57]:
+                    return "push_pattern"
+                elif data[0] in [0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F]:
+                    return "pop_pattern"
+                elif data[0] == 0xE8:
+                    return "call_pattern"
+                elif data[0] == 0xE9:
+                    return "jmp_pattern"
+                elif data[0:2] == b'\x8B\xFF':
+                    return "windows_pattern"
+                elif data[0] == 0x55 and len(data) > 1 and data[1] == 0x8B:
+                    return "function_prologue"
+        except Exception:
+            pass
+        return None
+
+    def hook_code(self, uc, address, size, user_data):
+        # Count instructions for progress tracking
+        self.instruction_count += 1
+
+        # Store execution history for analysis (avoid duplicates)
+        if len(self.execution_history) < 1000:
+            if not self.execution_history or self.execution_history[-1] != address:
+                self.execution_history.append(address)
+
+        # Periodically log progress and check for stalls
+        if self.instruction_count % self.max_instructions_before_check == 0:
+            current_time = time.time()
+            if current_time - self.last_progress_time > self.stall_timeout:
+                if self.instruction_count - self.last_instruction_count < self.max_instructions_before_check:
+                    self.log("[!] Stall detected! Emulation progress is too slow. Stopping.")
+                    uc.emu_stop()
+                    return
+            self.last_progress_time = current_time
+            self.last_instruction_count = self.instruction_count
+            self.log(f"[Progress] Executed {self.instruction_count} instructions, current address: 0x{address:x}")
+
+        # UPX-specific OEP detection. This is a high-confidence pattern.
+        if self.is_upx_packed and self.oep is None:
+            try:
+                inst_bytes = uc.mem_read(address, 1)
+                # Check for POPAD instruction (opcode 0x61)
+                if inst_bytes[0] == 0x61:
+                    self.log(f"[UPX] POPAD instruction found at 0x{address:x}")
+                    
+                    # The instruction after POPAD is the jump to OEP.
+                    next_inst_addr = address + 1
+                    # Read enough bytes for a potential JMP rel32 instruction (5 bytes)
+                    next_inst_bytes = uc.mem_read(next_inst_addr, 5)
+
+                    # Check for a long jump (E9 JMP rel32)
+                    if next_inst_bytes[0] == 0xE9:
+                        rel_offset = struct.unpack('<i', next_inst_bytes[1:5])[0]
+                        # OEP = address of instruction after JMP + relative offset
+                        self.oep = (next_inst_addr + 5) + rel_offset
+                        self.log(f"[UPX] Found JMP to OEP at 0x{self.oep:x}")
+                        uc.emu_stop()
+                        return # Stop further processing in this hook
+            except Exception:
+                # This can happen if we read near unmapped memory, just ignore.
+                pass
+
+        # Enhanced OEP detection with VMProtect awareness
+        if self.oep is None and self.pe is not None:
+            try:
+                image_base = self.pe.OPTIONAL_HEADER.ImageBase
+                image_size = self.pe.OPTIONAL_HEADER.SizeOfImage
+
+                # Read instruction bytes for analysis
+                try:
+                    inst_data = uc.mem_read(address, min(size, 16))
+                    pattern = self.analyze_instruction(address, inst_data)
+
+                    if pattern:
+                        try:
+                            section = self.pe.get_section_by_rva(address - image_base)
+                            if section:
+                                sec_name = section.Name.decode(errors='ignore').strip('\x00')
+
+                                # Skip VMProtect sections
+                                if any(vmp in sec_name.lower() for vmp in ['.vmp', '.upx', '.themida']):
+                                    return
+
+                                if sec_name in ['.text', '.code', 'CODE'] and pattern in ['function_prologue', 'windows_pattern']:
+                                    self.potential_oeps.append({
+                                        'address': address,
+                                        'pattern': pattern,
+                                        'section': sec_name,
+                                        'confidence': 0.8
+                                    })
+                                    self.log(f"[OEP Candidate] Found {pattern} in {sec_name} at 0x{address:x}")
+
+                                    if len(self.potential_oeps) >= 3 or pattern == 'windows_pattern':
+                                        self.oep = address
+                                        self.log(f"[!] High confidence OEP detected at 0x{address:x}")
+                                        uc.emu_stop()
+                                        return
+                        except Exception:
+                            pass
+
+                except Exception:
+                    pass
+
+                # Check for execution outside original image (unpacked code)
+                if address < image_base or address >= (image_base + image_size):
+                    # Throttle logs by page address to avoid floods
+                    page = address & ~(self.page_log_interval - 1)
+                    if page not in self.logged_pages:
+                        self.logged_pages.add(page)
+                        self.log(f"[!] Execution outside original image at 0x{address:x} (page 0x{page:x})")
+                        # Also check whether this page looks like contains an in-memory PE header:
+                        try:
+                            page_data = uc.mem_read(page, min(0x1000, 0x1000))
+                            if page_data.startswith(b'MZ') or b'This program cannot be run in DOS mode' in page_data[:0x400]:
+                                # Very strong candidate: an in-memory PE landed here
+                                self.log(f"[OEP Candidate] Detected in-memory PE header at page 0x{page:x}, treating as OEP candidate")
+                                try:
+                                    self.potential_oeps.append({
+                                        'address': page,
+                                        'pattern': 'in_memory_pe',
+                                        'section': 'unknown',
+                                        'confidence': 0.9
+                                    })
+                                    self.oep = page
+                                    uc.emu_stop()
+                                    return
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    return
+
+                # Check for section transitions
+                try:
+                    section = self.pe.get_section_by_rva(address - image_base)
+                    if section:
+                        sec_name = section.Name.decode(errors='ignore').strip('\x00')
+
+                        # Track unpacker sections
+                        if any(name in sec_name.lower() for name in ['.vmp', '.upx', '.themida', '.aspack']):
+                            self.unpacker_sections.add(sec_name)
+                            return
+
+                        # Detect transition from unpacker to original code
+                        if (len(self.unpacker_sections) > 0 and 
+                            sec_name not in self.unpacker_sections and 
+                            sec_name in ['.text', '.code', 'CODE', '.data', '.rdata']):
+
+                            self.log(f"[!] Transition from unpacker to original section '{sec_name}' at 0x{address:x}")
+                            self.potential_oeps.append({
+                                'address': address,
+                                'pattern': 'section_transition',
+                                'section': sec_name,
+                                'confidence': 0.9
+                            })
+
+                            if sec_name == '.text' or len(self.potential_oeps) >= 2:
+                                self.oep = address
+                                uc.emu_stop()
+                                return
+
+                except Exception as e:
+                    if address >= image_base and address < (image_base + image_size):
+                        self.log(f"[!] Execution at unmapped address 0x{address:x} within image")
+                        self.potential_oeps.append({
+                            'address': address,
+                            'pattern': 'unmapped_execution',
+                            'section': 'unknown',
+                            'confidence': 0.6
+                        })
+
+                        if len(self.potential_oeps) >= 5:
+                            self.oep = address
+                            uc.emu_stop()
+
+            except Exception as e:
+                self.log(f"[Debug] Error in code hook: {str(e)}")
+
+    def hook_mem_invalid(self, uc, access, address, size, value, user_data):
+        """Enhanced memory handler for VMProtect with aggressive (but safer) mapping"""
+        self.page_fault_count += 1
+        if self.page_fault_count > self.max_page_faults:
+            if self.page_fault_count % 100 == 0: # Log every 100 faults after limit
+                self.log(f"[Memory] Excessive page faults ({self.page_fault_count}), stopping to prevent infinite loop.")
+            uc.emu_stop()
+            return False
+
+        # Throttle logging for frequent faults
+        if self.page_fault_count % 50 != 0:
+            logging.debug(f"[Memory] Invalid memory access at 0x{address:x} (size: {size}, access: {access})")
+        else:
+            self.log(f"[Memory] Invalid memory access at 0x{address:x} (size: {size}, access: {access}) - fault count: {self.page_fault_count}")
+
+
+        try:
+            # Handle null pointer access
+            if address == 0:
+                self.log("[Memory] Null pointer access - mapping null page")
+                try:
+                    uc.mem_map(0, 0x1000)
+                    uc.mem_write(0, b'\x00' * 0x1000)
+                    self.log("[Memory] Null page mapped successfully")
+                    return True
+                except Exception as e:
+                    self.log(f"[Memory] Failed to map null page: {str(e)}")
+                    return False
+
+            # Align address to page boundary
+            page_size = 0x1000
+            aligned_addr = address & ~(page_size - 1)
+
+            # Get image information
+            image_base = self.pe.OPTIONAL_HEADER.ImageBase if self.pe else 0x400000
+
+            # Safer mapping strategy: try single page, then small region
+            try:
+                # Check if already mapped
+                try:
+                    uc.mem_read(aligned_addr, 1)
+                    return True
+                except Exception:
+                    pass
+
+                if aligned_addr < 0x80000000:
+                    # Special handling for very low addresses: map only the requested page
+                    if aligned_addr < 0x1000 and aligned_addr > 0:
+                        try:
+                            uc.mem_map(aligned_addr, page_size)
+                            uc.mem_write(aligned_addr, b'\x00' * page_size)
+                            self.log(f"[Memory] Mapped low page at 0x{aligned_addr:x}")
+                            return True
+                        except Exception as e:
+                            self.log(f"[Memory] Failed to map low page: {str(e)}")
+                            return False
+
+                    # Try to map the specific page
+                    try:
+                        uc.mem_map(aligned_addr, page_size)
+                        uc.mem_write(aligned_addr, b'\x00' * page_size)
+                        self.log(f"[Memory] Mapped page at 0x{aligned_addr:x}")
+                        return True
+                    except Exception as e:
+                        self.log(f"[Memory] Failed to map page at 0x{aligned_addr:x}: {str(e)}")
+
+                        # If single page fails, try mapping a slightly larger region
+                        try:
+                            region_size = 0x10000  # 64KB
+                            region_base = aligned_addr & ~(region_size - 1)
+                            if region_base + region_size <= 0x80000000:
+                                uc.mem_map(region_base, region_size)
+                                uc.mem_write(region_base, b'\x00' * region_size)
+                                self.log(f"[Memory] Mapped larger region at 0x{region_base:x} (size: 0x{region_size:x})")
+                                return True
+                        except Exception as e2:
+                            self.log(f"[Memory] Failed to map larger region: {str(e2)}")
+
+                        return False
+                else:
+                    self.log(f"[Memory] Address 0x{aligned_addr:x} too high for 32-bit emulation")
+                    return False
+
+            except Exception as e:
+                self.log(f"[Memory] Exception in memory mapping: {str(e)}")
+                return False
+
+        except Exception as e:
+            self.log(f"[Memory] Exception in memory handler: {str(e)}")
+            return False
+
+    # Aliases for unmapped hooks
+    def hook_mem_read_unmapped(self, uc, access, address, size, value, user_data):
+        return self.hook_mem_invalid(uc, access, address, size, value, user_data)
+
+    def hook_mem_write_unmapped(self, uc, access, address, size, value, user_data):
+        return self.hook_mem_invalid(uc, access, address, size, value, user_data)
+
+    def hook_mem_fetch_unmapped(self, uc, access, address, size, value, user_data):
+        return self.hook_mem_invalid(uc, access, address, size, value, user_data)
+
+    def unpack(self, timeout=30, max_instructions=2000000):
+        self.log("Starting enhanced unpacking process...")
+
+        # First, try static VMProtect extraction with better error handling
+        try:
+            with open(self.file_path, 'rb') as f:
+                pe_data = f.read()
+
+            self.vmprotect_data = self.extract_vmprotect_data(pe_data)
+            if self.vmprotect_data:
+                self.log("[VMProtect] Detected VMProtect patterns, attempting static extraction...")
+
+                # Debug the VMProtect structure
+                try:
+                    corrected = self.debug_vmprotect_structure(self.vmprotect_data)
+                except Exception as e:
+                    self.log(f"[VMProtect] Debugging exception: {e}")
+                    corrected = False
+
+                try:
+                    decompressed_sections = self.decompress_vmprotect_lzma(self.vmprotect_data)
+                except Exception as e:
+                    self.log(f"[VMProtect] Decompression exception: {e}")
+                    decompressed_sections = None
+                if decompressed_sections and len(decompressed_sections) > 0:
+                    self.log(f"[VMProtect] Successfully extracted {len(decompressed_sections)} compressed sections")
+                    # Skip Unicorn if we already unpacked successfully
+                    #return decompressed_sections
+                else:
+                    self.log("[VMProtect] Static extraction failed or produced no sections, relying on dynamic analysis")
+            else:
+                self.log("[VMProtect] No VMProtect patterns detected or extraction failed")
+        except Exception as e:
+            self.log(f"[VMProtect] Static extraction error: {str(e)}")
+
+        # Continue with enhanced dynamic analysis
+        if pefile is None:
+            self.log("[!] pefile module not available - cannot continue dynamic analysis")
+            return None
+
+        try:
+            self.pe = pefile.PE(self.file_path)
+        except pefile.PEFormatError as e:
+            self.log(f"[!] Error: Not a valid PE file. {e}")
+            return None
+
+        # Check for UPX sections to enable specialized logic
+        self.is_upx_packed = False
+        for section in self.pe.sections:
+            sec_name = section.Name.decode(errors='ignore').strip('\x00')
+            if 'upx' in sec_name.lower():
+                self.is_upx_packed = True
+                self.log("[UPX] Detected UPX packed file based on section names.")
+                break
+
+        # Store original entry point for reference
+        self.original_entry_point = self.pe.OPTIONAL_HEADER.ImageBase + self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
+
+        # Determine architecture and set up Unicorn Engine
+        machine_type = self.pe.FILE_HEADER.Machine
+        is_64bit = False
+
+        if machine_type == 0x014c:  # IMAGE_FILE_MACHINE_I386
+            self.log("Detected 32-bit PE file")
+            if Uc is None:
+                self.log("[!] Unicorn not available - cannot emulate")
+                return None
+            self.mu = Uc(UC_ARCH_X86, UC_MODE_32)
+            is_64bit = False
+        elif machine_type == 0x8664:  # IMAGE_FILE_MACHINE_AMD64
+            self.log("Detected 64-bit PE file")
+            if Uc is None:
+                self.log("[!] Unicorn not available - cannot emulate")
+                return None
+            self.mu = Uc(UC_ARCH_X86, UC_MODE_64)
+            is_64bit = True
+        else:
+            self.log(f"[!] Error: Unsupported architecture. Machine type: 0x{machine_type:x}")
+            return None
+
+        try:
+            image_base = self.pe.OPTIONAL_HEADER.ImageBase
+            image_size = self.pe.OPTIONAL_HEADER.SizeOfImage
+
+            # Enhanced memory layout for VMProtect
+            aligned_image_size = (image_size + 0x1000 - 1) & ~(0x1000 - 1)
+            # Reduced default extra space to reduce memory pressure
+            extra_space = 0x1000000  # 16MB extra space for VMProtect (was 64MB)
+            total_mapped_size = aligned_image_size + extra_space
+
+            self.log(f"Enhanced memory layout:")
+            self.log(f"  Image base: 0x{image_base:x}")
+            self.log(f"  Image size: 0x{aligned_image_size:x}")
+            self.log(f"  Extra space: 0x{extra_space:x}")
+            self.log(f"  Total mapped: 0x{total_mapped_size:x}")
+
+            # Map main memory region
+            try:
+                self.mu.mem_map(image_base, total_mapped_size)
+                # Initialize extra space in manageable chunks
+                chunk_size = 0x100000  # 1MB chunks
+                for offset in range(0, extra_space, chunk_size):
+                    actual_size = min(chunk_size, extra_space - offset)
+                    self.mu.mem_write(image_base + aligned_image_size + offset, b'\x00' * actual_size)
+
+                self.log("Successfully mapped main memory region")
+            except Exception as e:
+                self.log(f"[!] Failed to map memory: {str(e)}")
+                return None
+
+            # Store initial section information
+            for section in self.pe.sections:
+                sec_name = section.Name.decode(errors='ignore').strip('\x00')
+                self.initial_sections_info[sec_name] = {
+                    'executable': bool(section.Characteristics & 0x20000000),
+                    'virtual_address': section.VirtualAddress,
+                    'size': section.Misc_VirtualSize
+                }
+
+            # Enhanced PE data writing
+            self.log("Writing PE data to memory with enhanced method...")
+            pe_data = self.pe.write()
+
+            try:
+                # Write headers
+                headers_size = self.pe.OPTIONAL_HEADER.SizeOfHeaders
+                headers_data = bytes(pe_data[:headers_size])
+                self.mu.mem_write(image_base, headers_data)
+                self.log(f"Written PE headers: {len(headers_data)} bytes")
+
+                # Write each section individually with validation
+                for section in self.pe.sections:
+                    if section.PointerToRawData > 0 and section.SizeOfRawData > 0:
+                        try:
+                            if section.PointerToRawData + section.SizeOfRawData <= len(pe_data):
+                                section_data = pe_data[section.PointerToRawData:section.PointerToRawData + section.SizeOfRawData]
+                                section_data = bytes(section_data)
+
+                                target_addr = image_base + section.VirtualAddress
+                                if target_addr + len(section_data) <= image_base + total_mapped_size:
+                                    self.mu.mem_write(target_addr, section_data)
+                                    sec_name = section.Name.decode(errors='ignore').strip('\x00')
+                                    self.log(f"Written section {sec_name}: {len(section_data)} bytes at 0x{target_addr:x}")
+                                else:
+                                    sec_name = section.Name.decode(errors='ignore').strip('\x00')
+                                    self.log(f"Section {sec_name} extends beyond mapped memory, skipping")
+                            else:
+                                sec_name = section.Name.decode(errors='ignore').strip('\x00')
+                                self.log(f"Section {sec_name} extends beyond PE data, skipping")
+                        except Exception as sec_e:
+                            sec_name = section.Name.decode(errors='ignore').strip('\x00')
+                            self.log(f"Failed to write section {sec_name}: {str(sec_e)}")
+
+                self.log("PE data written successfully")
+
+            except Exception as e:
+                self.log(f"Failed to write PE data: {str(e)}")
+                return None
+
+            # For in-place unpackers like UPX, ensure all sections are writable.
+            if self.is_upx_packed:
+                self.log("[UPX] Setting all sections to Read/Write/Execute for in-place unpacking.")
+                try:
+                    for section in self.pe.sections:
+                        addr = image_base + section.VirtualAddress
+                        size = (section.Misc_VirtualSize + 0xFFF) & ~0xFFF # Align to page size
+                        self.mu.mem_protect(addr, size, UC_PROT_ALL)
+                except Exception as e:
+                    self.log(f"[!] Failed to change section permissions: {e}")
+
+
+            # Write VMProtect decompressed sections if available
+            if self.vmprotect_data:
+                try:
+                    decompressed_sections = self.decompress_vmprotect_lzma(self.vmprotect_data)
+                except Exception as e:
+                    self.log(f"[VMProtect] Decompression exception while writing: {e}")
+                    decompressed_sections = None
+
+                if decompressed_sections:
+                    for rva, data in decompressed_sections.items():
+                        try:
+                            target_addr = image_base + rva
+                            if target_addr + len(data) <= image_base + total_mapped_size:
+                                section_data = bytes(data) if not isinstance(data, bytes) else data
+                                self.mu.mem_write(target_addr, section_data)
+                                self.log(f"[VMProtect] Wrote decompressed section to 0x{target_addr:x} ({len(section_data)} bytes)")
+                            else:
+                                self.log(f"[VMProtect] Decompressed section at RVA 0x{rva:x} extends beyond mapped memory")
+                        except Exception as e:
+                            self.log(f"[VMProtect] Failed to write decompressed section: {str(e)}")
+
+            # Setup stack with better positioning
+            stack_base = 0x7fff0000 if not is_64bit else 0x7fff00000000
+            stack_size = 0x100000  # 1MB stack
+
+            try:
+                stack_mapped = False
+                for stack_attempt in [stack_base, 0x12340000, 0x50000000]:
+                    try:
+                        self.mu.mem_map(stack_attempt, stack_size)
+                        stack_addr = stack_attempt
+                        stack_mapped = True
+                        self.log(f"Stack mapped at 0x{stack_addr:x}")
+                        break
+                    except Exception:
+                        continue
+
+                if not stack_mapped:
+                    self.log("Failed to map stack at any location")
+                    return None
+
+                if is_64bit:
+                    self.mu.reg_write(UC_X86_REG_RSP, stack_addr + stack_size - 8)
+                    self.mu.reg_write(UC_X86_REG_RBP, 0)
+                else:
+                    self.mu.reg_write(UC_X86_REG_ESP, stack_addr + stack_size - 4)
+                    self.mu.reg_write(UC_X86_REG_EBP, 0)
+
+            except Exception as e:
+                self.log(f"Failed to setup stack: {str(e)}")
+                return None
+
+            # Install hooks with enhanced error handling
+            try:
+                self.mu.hook_add(UC_HOOK_CODE, self.hook_code)
+                self.log("Code hook installed")
+
+                try:
+                    self.mu.hook_add(UC_HOOK_MEM_READ_UNMAPPED, self.hook_mem_read_unmapped)
+                    self.mu.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, self.hook_mem_write_unmapped)
+                    self.mu.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, self.hook_mem_fetch_unmapped)
+                    try:
+                        self.mu.hook_add(UC_HOOK_MEM_INVALID, self.hook_mem_invalid)
+                        self.log("All memory access hooks installed successfully")
+                    except Exception:
+                        self.log("Memory access hooks installed (no invalid hook)")
+                except Exception as hook_e:
+                    self.log(f"Some memory hooks failed: {str(hook_e)}")
+
+            except Exception as e:
+                self.log(f"Failed to install hooks: {str(e)}. Continuing with limited functionality.")
+
+            # Pre-map common memory regions that VMProtect might access (best-effort)
+            self.log("Pre-mapping common VMProtect memory regions...")
+            common_regions = [
+                (0x1000, 0xF000),      # Low memory region
+                (0x10000, 0x10000),    # Additional low region
+                (0x77000000, 0x1000000), # Common Windows DLL region
+                (0x7c800000, 0x800000),  # Another Windows region
+            ]
+
+            for base, size in common_regions:
+                try:
+                    # Skip regions that overlap with our image mapping to avoid conflicts
+                    if not (base >= image_base + total_mapped_size or base + size <= image_base):
+                        continue
+                    self.mu.mem_map(base, size)
+                    chunk_size = 0x10000
+                    for offset in range(0, size, chunk_size):
+                        actual_size = min(chunk_size, size - offset)
+                        self.mu.mem_write(base + offset, b'\x00' * actual_size)
+                    self.log(f"Pre-mapped region 0x{base:x}-0x{base+size:x}")
+                except Exception:
+                    # Not critical if pre-mapping fails
+                    pass
+
+            # Validate entry point before emulation
+            entry_point = self.original_entry_point
+            if entry_point < image_base or entry_point >= image_base + image_size:
+                self.log(f"[!] Warning: Entry point 0x{entry_point:x} outside image bounds")
+                for section in self.pe.sections:
+                    sec_name = section.Name.decode(errors='ignore').strip('\x00')
+                    if 'vmp' in sec_name.lower() or 'text' in sec_name.lower():
+                        alt_entry = image_base + section.VirtualAddress
+                        self.log(f"Trying alternative entry point in {sec_name}: 0x{alt_entry:x}")
+                        entry_point = alt_entry
+                        break
+
+            try:
+                entry_bytes = self.mu.mem_read(entry_point, 16)
+                self.log(f"Entry point bytes: {entry_bytes.hex()}")
+
+                if entry_bytes[:4] == b'\x00\x00\x00\x00':
+                    self.log("[!] Entry point contains null bytes, may be invalid")
+                elif entry_bytes[0] in [0xCC, 0xC3]:
+                    self.log("[!] Entry point starts with breakpoint or return")
+
+            except Exception as e:
+                self.log(f"[!] Cannot read entry point: {str(e)}")
+                return None
+
+            # Calculate end address more conservatively
+            end_address = image_base + total_mapped_size -1
+
+            self.log(f"Starting enhanced emulation:")
+            self.log(f"  Entry Point: 0x{entry_point:x}")
+            self.log(f"  End Address: 0x{end_address:x}")
+            self.log(f"  Architecture: {'64-bit' if is_64bit else '32-bit'}")
+            self.log(f"  Timeout: {timeout}s")
+            self.log(f"  Max Instructions: {max_instructions}")
+
+            # Start emulation with enhanced parameters and error recovery
+            emulation_attempts = [
+                (timeout * 1000000, max_instructions),      # Full timeout
+                (10 * 1000000, max_instructions // 2),      # Shorter timeout
+                (5 * 1000000, 100000),                      # Very short run
+            ]
+
+            emulation_success = False
+            for attempt, (timeout_us, max_inst) in enumerate(emulation_attempts):
+                try:
+                    self.log(f"Emulation attempt {attempt + 1}: timeout={timeout_us//1000000}s, max_inst={max_inst}")
+                    self.mu.emu_start(
+                        int(entry_point),
+                        int(end_address),
+                        timeout=int(timeout_us),
+                        count=int(max_inst)
+                    )
+                    emulation_success = True
+                    self.log(f"Emulation attempt {attempt + 1} completed successfully")
+                    break
+
+                except Exception as e:
+                    self.log(f"Emulation attempt {attempt + 1} failed: {str(e)}")
+
+                    if self.instruction_count > 10:
+                        emulation_success = True
+                        self.log(f"Partial success - executed {self.instruction_count} instructions")
+                        break
+
+                    self.instruction_count = 0
+
+                    if attempt == len(emulation_attempts) - 1:
+                        self.log("All emulation attempts failed, trying single-step mode")
+                        try:
+                            for i in range(100):
+                                try:
+                                    self.mu.emu_start(entry_point + i, entry_point + i + 1, count=1)
+                                    self.instruction_count += 1
+                                except Exception:
+                                    break
+                            if self.instruction_count > 0:
+                                emulation_success = True
+                                self.log(f"Single-step mode executed {self.instruction_count} instructions")
+                        except Exception as single_e:
+                            self.log(f"Single-step mode also failed: {str(single_e)}")
+
+            if not emulation_success:
+                self.log("All emulation attempts failed")
+
+            # Continue with analysis even if emulation had issues
+            self.log(f"Emulation completed. Executed {self.instruction_count} instructions.")
+
+            if self.oep:
+                self.log(f"SUCCESS: Found OEP at 0x{self.oep:x}")
+            elif self.potential_oeps:
+                best_oep = max(self.potential_oeps, key=lambda x: x['confidence'])
+                self.oep = best_oep['address']
+                self.log(f"Selected best OEP candidate: 0x{self.oep:x} (confidence: {best_oep['confidence']}, pattern: {best_oep['pattern']})")
+            else:
+                self.log("No OEP found during emulation")
+
+            if not self.oep:
+                try:
+                    self.dump_executed_pages("dumped_pages")
+                except Exception as e:
+                    self.log(f"[!] Failed to dump executed pages: {e}")
+
+            # Prepare result
+            if self.oep or self.vmprotect_data:
+                unpacked_path = None
+                try:
+                    unpacked_data = self.mu.mem_read(image_base, aligned_image_size)
+                    # Use a temporary file to avoid passing large data through signals
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin", prefix="unpacked_") as tmp:
+                        tmp.write(unpacked_data)
+                        unpacked_path = tmp.name
+                    self.log(f"Unpacked data saved temporarily to {unpacked_path}")
+                except Exception:
+                    unpacked_path = None
+                    self.log("Failed to read unpacked data from memory")
+
+                result = {
+                    "oep": self.oep,
+                    "unpacked_data_path": unpacked_path,
+                    "original_pe_path": self.file_path,
+                    "instruction_count": self.instruction_count,
+                    "potential_oeps": self.potential_oeps,
+                    "unpacker_sections": list(self.unpacker_sections)
+                }
+
+                if self.vmprotect_data:
+                    result["vmprotect_data"] = self.vmprotect_data
+                    try:
+                        decompressed_sections = self.decompress_vmprotect_lzma(self.vmprotect_data)
+                        if decompressed_sections:
+                            ds_paths = {}
+                            with tempfile.TemporaryDirectory() as tmpdir:
+                                for rva, data in decompressed_sections.items():
+                                    path = os.path.join(tmpdir, f"ds_{rva:x}.bin")
+                                    with open(path, "wb") as f:
+                                        f.write(data)
+                                    ds_paths[rva] = path
+                            result["decompressed_section_paths"] = ds_paths
+                        else:
+                            result["decompressed_sections"] = None
+                    except Exception as e:
+                        self.log(f"[VMProtect] Decompression exception while building result: {e}")
+                        result["decompressed_sections"] = None
+
+
+                return result
+            else:
+                self.log("Unpacking failed - no OEP found and no VMProtect data extracted")
+                return None
+
+        except Exception as e:
+            self.log(f"[!] Critical error during unpacking: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def save_unpacked_file(self, result, output_path):
+        """Save the unpacked file with proper PE structure reconstruction"""
+        unpacked_data_path = result.get("unpacked_data_path")
+        if not unpacked_data_path or not os.path.exists(unpacked_data_path):
+            self.log("No unpacked data to save")
+            return False
+
+        try:
+            with open(unpacked_data_path, "rb") as f:
+                unpacked_data = f.read()
+            
+            original_pe = pefile.PE(result["original_pe_path"])
+
+            # Fix the entry point if OEP was found
+            if result.get("oep"):
+                oep_rva = result["oep"] - original_pe.OPTIONAL_HEADER.ImageBase
+                original_pe.OPTIONAL_HEADER.AddressOfEntryPoint = oep_rva
+                self.log(f"Updated entry point to 0x{oep_rva:x}")
+
+            # Reconstruct PE with unpacked data
+            pe_data = bytearray(original_pe.write())
+
+            # Update section data with unpacked content
+            for section in original_pe.sections:
+                if section.VirtualAddress < len(unpacked_data):
+                    section_start = section.VirtualAddress
+                    section_size = min(section.Misc_VirtualSize, len(unpacked_data) - section_start)
+
+                    if section_size > 0:
+                        section_data = unpacked_data[section_start:section_start + section_size]
+
+                        # Update raw data if section has file mapping
+                        if section.PointerToRawData > 0:
+                            raw_size = min(len(section_data), section.SizeOfRawData)
+                            pe_data[section.PointerToRawData:section.PointerToRawData + raw_size] = section_data[:raw_size]
+
+            # Write VMProtect decompressed sections if available
+            decompressed_paths = result.get("decompressed_section_paths", {})
+            if decompressed_paths:
+                for rva, path in decompressed_paths.items():
+                    if os.path.exists(path):
+                        with open(path, "rb") as f:
+                            data = f.read()
+                        if rva < len(unpacked_data):
+                            for section in original_pe.sections:
+                                if (section.VirtualAddress <= rva < 
+                                    section.VirtualAddress + section.Misc_VirtualSize):
+
+                                    if section.PointerToRawData > 0:
+                                        offset_in_section = rva - section.VirtualAddress
+                                        raw_offset = section.PointerToRawData + offset_in_section
+                                        data_size = min(len(data), len(pe_data) - raw_offset)
+
+                                        if data_size > 0:
+                                            pe_data[raw_offset:raw_offset + data_size] = data[:data_size]
+                                            self.log(f"Applied VMProtect decompressed data to section at RVA 0x{rva:x}")
+                                    break
+
+            # Save the reconstructed PE file
+            with open(output_path, 'wb') as f:
+                f.write(pe_data)
+
+            self.log(f"Unpacked file saved to: {output_path}")
+
+            if result.get("oep"):
+                self.log(f"New entry point: 0x{result['oep']:x}")
+            if result.get("instruction_count"):
+                self.log(f"Instructions executed: {result['instruction_count']}")
+            if decompressed_paths:
+                self.log(f"VMProtect sections decompressed: {len(decompressed_paths)}")
+
+            return True
+
+        except Exception as e:
+            self.log(f"Failed to save unpacked file: {str(e)}")
+            return False
+        finally:
+            # Clean up temporary file
+            if os.path.exists(unpacked_data_path):
+                try:
+                    os.remove(unpacked_data_path)
+                except OSError:
+                    pass
 
 # --- Helper Functions ---
 
@@ -853,7 +2167,7 @@ def parse_capa_output(capa_text: str) -> List[Dict[str, Any]]:
                 matches.append({'capability': capability, 'address': addr})
     return matches
 
-def run_capa_analysis(file_path: str, capa_exe_path: str = "capa.exe") -> Optional[str]:
+def run_capa_analysis(file_path: str, capa_exe_path: str = "capa.exe", **kwargs) -> Optional[str]:
     """
     Runs CAPA analysis on a file and saves the results to a unique directory.
     """
@@ -906,6 +2220,109 @@ def run_capa_analysis(file_path: str, capa_exe_path: str = "capa.exe") -> Option
         logging.error(f"An unexpected error occurred during CAPA analysis on {file_path}: {ex}")
         return None
 
+# --- Graph Visualization Classes ---
+
+class Arrow(QGraphicsLineItem):
+    """A QGraphicsLineItem with an arrowhead."""
+    def __init__(self, source_point, dest_point, parent=None):
+        super().__init__(source_point.x(), source_point.y(), dest_point.x(), dest_point.y(), parent)
+        self.arrow_size = 10
+
+    def paint(self, painter, option, widget=None):
+        # Draw the line
+        painter.setPen(self.pen())
+        painter.drawLine(self.line())
+
+        # Draw the arrowhead
+        angle = math.atan2(-self.line().dy(), self.line().dx())
+        arrow_p1 = self.line().p2() - QPointF(math.sin(angle + math.pi / 3) * self.arrow_size,
+                                             math.cos(angle + math.pi / 3) * self.arrow_size)
+        arrow_p2 = self.line().p2() - QPointF(math.sin(angle + math.pi - math.pi / 3) * self.arrow_size,
+                                             math.cos(angle + math.pi - math.pi / 3) * self.arrow_size)
+        
+        arrow_head = QPolygonF([self.line().p2(), arrow_p1, arrow_p2])
+        painter.setBrush(self.pen().color())
+        painter.drawPolygon(arrow_head)
+
+class GraphNode(QGraphicsItem):
+    """A movable node for the function call graph."""
+    def __init__(self, name, node_type='dll', full_name=None):
+        super().__init__()
+        self.name = name
+        self.node_type = node_type
+        self.full_name = full_name or name
+        self.edges = []
+        self.setFlag(QGraphicsItem.ItemIsMovable)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
+        self.setCacheMode(QGraphicsItem.DeviceCoordinateCache)
+        self.setZValue(1)
+        self.setToolTip(self.full_name)
+
+    def boundingRect(self):
+        # Adjust size based on node type for better visualization
+        if self.node_type == 'function':
+            return QtCore.QRectF(-60, -15, 120, 30)
+        return QtCore.QRectF(-75, -20, 150, 40)
+
+    def paint(self, painter, option, widget):
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.boundingRect()
+        
+        # Color coding based on node type
+        if self.node_type == 'exe':
+            brush_color = QColor("#007ACC") # Blue
+            pen_color = QColor("#FFFFFF")
+        elif self.node_type == 'dll':
+            brush_color = QColor("#3E3E42") # Dark Grey
+            pen_color = QColor("#CCCCCC")
+        else: # function
+            brush_color = QColor("#6A9955") # Green
+            pen_color = QColor("#FFFFFF")
+            
+        painter.setBrush(brush_color)
+        painter.setPen(QPen(pen_color, 2))
+        painter.drawRoundedRect(rect, 10, 10)
+        
+        painter.setPen(pen_color)
+        painter.drawText(rect, Qt.AlignCenter, self.name)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionHasChanged:
+            for edge in self.edges:
+                edge.adjust()
+        return super().itemChange(change, value)
+
+class GraphEdge(QGraphicsItem):
+    """An edge connecting two nodes in the graph."""
+    def __init__(self, source, dest):
+        super().__init__()
+        self.source = source
+        self.dest = dest
+        self.source.edges.append(self)
+        self.dest.edges.append(self)
+        self.adjust()
+        self.setZValue(0)
+
+    def boundingRect(self):
+        return self.path.boundingRect() if hasattr(self, 'path') else QtCore.QRectF()
+
+    def paint(self, painter, option, widget):
+        if not self.source or not self.dest:
+            return
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#888888"), 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawPath(self.path)
+
+    def adjust(self):
+        if not self.source or not self.dest:
+            return
+        self.prepareGeometryChange()
+        
+        line = QtCore.QLineF(self.mapFromItem(self.source, 0, 0), self.mapFromItem(self.dest, 0, 0))
+        self.path = QPainterPath()
+        self.path.moveTo(line.p1())
+        self.path.lineTo(line.p2())
+
 # --- Main Application Window ---
 
 class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
@@ -915,7 +2332,15 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setWindowIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon))
-        self.resize(1600, 1000)
+        self.resize(1800, 1200)
+
+        # --- Thread Pool ---
+        self.threadpool = QThreadPool()
+        self.threadpool.setMaxThreadCount(128)
+        logging.info("Multithreading with maximum %d threads" % self.threadpool.maxThreadCount())
+        
+        # --- Task Management ---
+        self.task_counter = 0
 
         # --- Application State ---
         self.settings = self.load_settings()
@@ -925,17 +2350,20 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.file_b_path: Optional[str] = self.settings.get("file_b_path")
         self.yara_path: Optional[str] = self.settings.get("yara_path")
         self.excluded_rules = set()
-
         
         self.file_a_data: Optional[bytearray] = None
         self.file_b_data: Optional[bytearray] = None
         
         self.pe_features_a: Optional[Dict] = None
         self.pe_features_b: Optional[Dict] = None
+        
+        self.unpacker_result_a: Optional[Dict] = None
+        self.unpacker_result_b: Optional[Dict] = None
+
 
         self.matches_a: List[Dict] = []
         self.matches_b: List[Dict] = []
-        self.capa_matches: List[Tuple[str, Dict]] = [] # e.g. [('A', {'cap': '...', 'addr': ...})]
+        self.capa_matches: List[Tuple[str, Dict]] = []
         self.diff_hunks: List[Dict] = []
         self.yara_index: Dict = {}
         self._yara_keys: List = []
@@ -946,8 +2374,12 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.show_diff: bool = True
         self.context: int = self.settings.get("context", DEFAULT_CONTEXT_SIZE)
         
-        # --- Initialize Feature Extractor ---
         self.pe_extractor = PEFeatureExtractor()
+        
+        self.graph_view_mode = "unified"
+        self.graph_nodes = {}
+        
+        self.current_center_offset = 0
 
         # --- Build UI ---
         self._build_ui()
@@ -963,13 +2395,11 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             self.load_yara_file(self.yara_path, silent=True)
 
     def closeEvent(self, event):
-        """Save settings on exit."""
         self.save_settings()
         super().closeEvent(event)
 
     # --- UI Building ---
     def _build_ui(self):
-        """Construct the entire user interface."""
         self.central_widget = QtWidgets.QWidget()
         self.setCentralWidget(self.central_widget)
         self.outer_layout = QtWidgets.QVBoxLayout(self.central_widget)
@@ -979,7 +2409,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self._create_status_bar()
 
     def _create_toolbar(self):
-        """Create the top toolbar with file operations and controls."""
         toolbar = QtWidgets.QHBoxLayout()
         
         btn_load_a = QtWidgets.QPushButton(self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon), " Load File A")
@@ -996,7 +2425,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         
         toolbar.addSpacing(20)
 
-        # Analysis Toolbar
         analysis_group = QtWidgets.QGroupBox("Analysis")
         analysis_layout = QtWidgets.QHBoxLayout(analysis_group)
         
@@ -1033,23 +2461,57 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.outer_layout.addLayout(toolbar)
 
     def _create_main_layout(self):
-        """Create the main splitter layout with left and right panes."""
         main_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.outer_layout.addWidget(main_split, stretch=1)
 
-        # --- Left Pane (Lists and Editors) ---
         left_pane = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_pane)
         main_split.addWidget(left_pane)
         left_pane.setMinimumWidth(450)
 
         self.main_tabs = QtWidgets.QTabWidget()
+        self.main_tabs.currentChanged.connect(self.on_main_tab_changed)
         left_layout.addWidget(self.main_tabs, stretch=1)
 
-        # --- Results Tab ---
+        # --- Tabs on the Left ---
+        self._create_results_tab(self.main_tabs)
+        self._create_pe_analysis_tab(self.main_tabs)
+        self._create_roadmap_tab(self.main_tabs)
+        self._create_call_view_tab(self.main_tabs)
+        self._create_assembly_roadmap_tab(self.main_tabs)
+        self._create_unpacker_tab(self.main_tabs)
+        self._create_die_tab(self.main_tabs)
+        self._create_editors_tab(self.main_tabs)
+        self._create_yargen_gui_tab(self.main_tabs)
+        self._create_clamav_gui_tab(self.main_tabs)
+        self._create_base64_tool_tab(self.main_tabs)
+        self._create_excluded_rules_tab(self.main_tabs)
+        self._create_task_manager_tab(self.main_tabs)
+
+        left_layout.addWidget(QtWidgets.QLabel("<b>Selection Details</b>"))
+        self.details = QtWidgets.QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumHeight(160)
+        left_layout.addWidget(self.details)
+
+        # --- Right Pane (Unified View) ---
+        right_pane = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_pane)
+        main_split.addWidget(right_pane)
+
+        self._create_unified_views(right_layout)
+        
+        main_split.setSizes([500, 1300])
+
+    def _create_results_tab(self, parent_tabs):
         results_widget = QtWidgets.QWidget()
         results_layout = QtWidgets.QVBoxLayout(results_widget)
-        self.main_tabs.addTab(results_widget, "Scan Results")
+        parent_tabs.addTab(results_widget, "Scan Results")
+
+        self.search_results_edit = QtWidgets.QLineEdit()
+        self.search_results_edit.setPlaceholderText("Search results...")
+        self.search_results_edit.textChanged.connect(self.filter_results)
+        results_layout.addWidget(self.search_results_edit)
 
         self.hunk_list = QtWidgets.QListWidget()
         self.hunk_list.itemSelectionChanged.connect(self.on_select_hunk)
@@ -1066,68 +2528,15 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         results_layout.addWidget(QtWidgets.QLabel("<b>CAPA Matches</b>"))
         results_layout.addWidget(self.capa_list)
 
-        # --- PE Analysis Tab ---
-        self._create_pe_analysis_tab(self.main_tabs)
-
-        # --- DetectItEasy Tab ---
-        self.die_output = QtWidgets.QPlainTextEdit()
-        self.die_output.setReadOnly(True)
-        self.die_output.setFont(QtGui.QFont("Consolas", 10))
-        self.main_tabs.addTab(self.die_output, "DetectItEasy")
-        
-        # --- Editors Tab ---
-        editors_widget = QtWidgets.QWidget()
-        editors_layout = QtWidgets.QVBoxLayout(editors_widget)
-        self.main_tabs.addTab(editors_widget, "Editors")
-        
-        editor_tabs = QtWidgets.QTabWidget()
-        editors_layout.addWidget(editor_tabs)
-
-        yara_editor_widget = self._create_editor_tab("YARA Editor", self.save_yara_from_editor, self.validate_yara_editor)
-        self.yara_editor = yara_editor_widget.findChild(QtWidgets.QTextEdit)
-        self.yara_highlighter = YaraHighlighter(self.yara_editor.document())
-        editor_tabs.addTab(yara_editor_widget, "YARA Editor")
-        
-        capa_editor_widget = self._create_editor_tab("CAPA Editor")
-        self.capa_editor = capa_editor_widget.findChild(QtWidgets.QTextEdit)
-        self.capa_highlighter = CapaHighlighter(self.capa_editor.document())
-        editor_tabs.addTab(capa_editor_widget, "CAPA Editor")
-
-        # --- yarGen GUI Tab ---
-        self._create_yargen_gui_tab(self.main_tabs)
-
-        # --- ClamAV SigTool Tab ---
-        self._create_clamav_gui_tab(self.main_tabs)
-        
-        # --- Excluded Rules Tab ---
-        self._create_excluded_rules_tab(self.main_tabs)
-
-        left_layout.addWidget(QtWidgets.QLabel("<b>Selection Details</b>"))
-        self.details = QtWidgets.QPlainTextEdit()
-        self.details.setReadOnly(True)
-        self.details.setMaximumHeight(160)
-        left_layout.addWidget(self.details)
-
-        # --- Right Pane (Hex and Asm) ---
-        right_pane = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right_pane)
-        main_split.addWidget(right_pane)
-
-        self._create_hex_view(right_layout)
-        self._create_asm_view(right_layout)
-        
-        main_split.setSizes([500, 1100])
-
     def _create_pe_analysis_tab(self, parent_tabs):
-        """Creates the tab for PE feature extraction and resource viewing."""
         pe_widget = QtWidgets.QWidget()
         pe_layout = QtWidgets.QVBoxLayout(pe_widget)
         parent_tabs.addTab(pe_widget, "PE Analysis")
 
-        # Toolbar for this tab
         pe_toolbar = QtWidgets.QHBoxLayout()
         self.pe_file_selector = QtWidgets.QComboBox()
         self.pe_file_selector.addItems(["File A", "File B"])
+        self.pe_file_selector.currentTextChanged.connect(self.display_pe_features)
         pe_toolbar.addWidget(QtWidgets.QLabel("Target:"))
         pe_toolbar.addWidget(self.pe_file_selector)
         
@@ -1137,25 +2546,119 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         pe_toolbar.addWidget(self.btn_generate_yara)
         pe_toolbar.addStretch()
         pe_layout.addLayout(pe_toolbar)
+        
+        self.search_pe_edit = QtWidgets.QLineEdit()
+        self.search_pe_edit.setPlaceholderText("Search PE info...")
+        self.search_pe_edit.textChanged.connect(self.filter_pe_analysis)
+        pe_layout.addWidget(self.search_pe_edit)
 
-        # Tab widget for features and resources
         pe_analysis_tabs = QtWidgets.QTabWidget()
         pe_layout.addWidget(pe_analysis_tabs)
 
-        # Features view
         self.pe_features_output = QtWidgets.QTextEdit()
         self.pe_features_output.setReadOnly(True)
         self.pe_features_output.setFont(QtGui.QFont("Consolas", 10))
         pe_analysis_tabs.addTab(self.pe_features_output, "Extracted Features")
 
-        # Resource viewer
         self.resource_tree = QtWidgets.QTreeWidget()
         self.resource_tree.setHeaderLabels(["Type", "ID/Name", "Language", "Size", "Offset"])
         self.resource_tree.setColumnWidth(0, 150)
         pe_analysis_tabs.addTab(self.resource_tree, "Resource Viewer")
 
-    def _create_editor_tab(self, title, save_func=None, validate_func=None):
-        """Helper to create a generic editor tab with optional buttons."""
+    def _create_roadmap_tab(self, parent_tabs):
+        roadmap_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(roadmap_widget)
+        parent_tabs.addTab(roadmap_widget, "File Roadmap")
+
+        self.roadmap_scene = QGraphicsScene()
+        self.roadmap_view = ZoomableView(self.roadmap_scene)
+        layout.addWidget(self.roadmap_view)
+
+    def _create_call_view_tab(self, parent_tabs):
+        call_view_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(call_view_widget)
+        parent_tabs.addTab(call_view_widget, "Call View")
+
+        self.search_call_view_edit = QtWidgets.QLineEdit()
+        self.search_call_view_edit.setPlaceholderText("Search imports...")
+        self.search_call_view_edit.textChanged.connect(self.filter_call_view)
+        layout.addWidget(self.search_call_view_edit)
+
+        self.call_view_tree = QtWidgets.QTreeWidget()
+        self.call_view_tree.setHeaderLabels(["DLL / Function", "Address"])
+        self.call_view_tree.itemClicked.connect(self.on_call_view_item_selected)
+        layout.addWidget(self.call_view_tree)
+
+    def _create_assembly_roadmap_tab(self, parent_tabs):
+        asm_roadmap_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(asm_roadmap_widget)
+        parent_tabs.addTab(asm_roadmap_widget, "Assembly Roadmap")
+
+        self.asm_roadmap_scene = QGraphicsScene()
+        self.asm_roadmap_view = ZoomableView(self.asm_roadmap_scene)
+        layout.addWidget(self.asm_roadmap_view)
+
+    def _create_unpacker_tab(self, parent_tabs):
+        unpacker_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(unpacker_widget)
+        parent_tabs.addTab(unpacker_widget, "Unpacker")
+
+        toolbar = QtWidgets.QHBoxLayout()
+        btn_unpack_a = QtWidgets.QPushButton("Unpack File A")
+        btn_unpack_a.clicked.connect(lambda: self.run_unpacker('A'))
+        toolbar.addWidget(btn_unpack_a)
+        
+        btn_unpack_b = QtWidgets.QPushButton("Unpack File B")
+        btn_unpack_b.clicked.connect(lambda: self.run_unpacker('B'))
+        toolbar.addWidget(btn_unpack_b)
+
+        self.btn_save_unpacked_a = QtWidgets.QPushButton("Save Unpacked A")
+        self.btn_save_unpacked_a.clicked.connect(lambda: self.save_unpacked_file_dialog('A'))
+        self.btn_save_unpacked_a.setEnabled(False)
+        toolbar.addWidget(self.btn_save_unpacked_a)
+        
+        self.btn_save_unpacked_b = QtWidgets.QPushButton("Save Unpacked B")
+        self.btn_save_unpacked_b.clicked.connect(lambda: self.save_unpacked_file_dialog('B'))
+        self.btn_save_unpacked_b.setEnabled(False)
+        toolbar.addWidget(self.btn_save_unpacked_b)
+        
+        layout.addLayout(toolbar)
+
+        self.unpacker_console = QtWidgets.QPlainTextEdit()
+        self.unpacker_console.setReadOnly(True)
+        self.unpacker_console.setFont(QtGui.QFont("Consolas", 10))
+        layout.addWidget(self.unpacker_console)
+
+    def _create_die_tab(self, parent_tabs):
+        self.die_output = QtWidgets.QPlainTextEdit()
+        self.die_output.setReadOnly(True)
+        self.die_output.setFont(QtGui.QFont("Consolas", 10))
+        parent_tabs.addTab(self.die_output, "DetectItEasy")
+        
+    def _create_editors_tab(self, parent_tabs):
+        editors_widget = QtWidgets.QWidget()
+        editors_layout = QtWidgets.QVBoxLayout(editors_widget)
+        parent_tabs.addTab(editors_widget, "Editors")
+        
+        self.search_editor_edit = QtWidgets.QLineEdit()
+        self.search_editor_edit.setPlaceholderText("Search in editor...")
+        self.search_editor_edit.textChanged.connect(self.filter_editors)
+        editors_layout.addWidget(self.search_editor_edit)
+
+        editor_tabs = QtWidgets.QTabWidget()
+        editors_layout.addWidget(editor_tabs)
+
+        yara_editor_widget = self._create_editor_tab_content(self.save_yara_from_editor, self.validate_yara_editor)
+        self.yara_editor = yara_editor_widget.findChild(QtWidgets.QTextEdit)
+        self.yara_highlighter = YaraHighlighter(self.yara_editor.document())
+        editor_tabs.addTab(yara_editor_widget, "YARA Editor")
+        
+        capa_editor_widget = self._create_editor_tab_content()
+        self.capa_editor = capa_editor_widget.findChild(QtWidgets.QTextEdit)
+        self.capa_highlighter = CapaHighlighter(self.capa_editor.document())
+        editor_tabs.addTab(capa_editor_widget, "CAPA Editor")
+
+    def _create_editor_tab_content(self, save_func=None, validate_func=None):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setContentsMargins(0, 5, 0, 0)
@@ -1180,7 +2683,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         return widget
 
     def _create_yargen_gui_tab(self, tabs):
-        """Create the yarGen GUI tab with all its controls."""
         self.yargen_widget = QtWidgets.QWidget()
         yargen_layout = QtWidgets.QVBoxLayout(self.yargen_widget)
         
@@ -1189,7 +2691,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.yargen_malware_path = QtWidgets.QLineEdit()
         self.yargen_output_file = QtWidgets.QLineEdit()
         self.yargen_author = QtWidgets.QLineEdit("Emirhan Ucan & Hacimurad")
-        self.yargen_reference = QtWidgets.QLineEdit("VirusShare, VirusSign, ClamAV, Dr.Web, Emsisoft, Avast, VirusTotal")
+        self.yargen_reference = QtWidgets.QLineEdit("VirusShare, VirusTotal, etc.")
         
         form_layout.addRow("Malware Path (-m):", self.yargen_malware_path)
         form_layout.addRow("Output File (-o):", self.yargen_output_file)
@@ -1228,11 +2730,9 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         tabs.addTab(self.yargen_widget, "yarGen GUI")
 
     def _create_clamav_gui_tab(self, tabs):
-        """Create the ClamAV SigTool GUI tab."""
         self.clamav_widget = QtWidgets.QWidget()
         clamav_layout = QtWidgets.QVBoxLayout(self.clamav_widget)
         
-        # --- Database Inspector ---
         db_inspector_group = QtWidgets.QGroupBox("Database Inspector")
         db_inspector_layout = QtWidgets.QVBoxLayout(db_inspector_group)
 
@@ -1247,12 +2747,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         
         form_layout = QtWidgets.QFormLayout()
         self.clamav_command_select = QtWidgets.QComboBox()
-        self.clamav_command_select.addItems([
-            "Info (--info)", 
-            "List Signatures (--list-sigs)", 
-            "Unpack (--unpack)", 
-            "Find Signatures (--find-sigs)"
-        ])
+        self.clamav_command_select.addItems(["Info (--info)", "List Signatures (--list-sigs)", "Unpack (--unpack)", "Find Signatures (--find-sigs)"])
         self.clamav_command_select.currentTextChanged.connect(self.on_clamav_command_change)
         form_layout.addRow("Command:", self.clamav_command_select)
         
@@ -1270,7 +2765,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         db_inspector_layout.addWidget(btn_run_sigtool)
         clamav_layout.addWidget(db_inspector_group)
 
-        # --- Signature Decoder ---
         decoder_group = QtWidgets.QGroupBox("Signature Decoder")
         decoder_layout = QtWidgets.QVBoxLayout(decoder_group)
         
@@ -1286,7 +2780,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         decoder_layout.addWidget(btn_decode_sig)
         clamav_layout.addWidget(decoder_group)
 
-        # --- Console Output ---
         clamav_layout.addWidget(QtWidgets.QLabel("<b>SigTool Output</b>"))
         self.clamav_console = QtWidgets.QPlainTextEdit()
         self.clamav_console.setReadOnly(True)
@@ -1295,8 +2788,39 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         
         tabs.addTab(self.clamav_widget, "ClamAV SigTool")
 
+    def _create_base64_tool_tab(self, tabs):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        
+        layout.addWidget(QtWidgets.QLabel("<b>Input</b>"))
+        self.base64_input = QtWidgets.QTextEdit()
+        self.base64_input.setPlaceholderText("Enter text or hex string to encode/decode")
+        self.base64_input.setFont(QtGui.QFont("Consolas", 10))
+        layout.addWidget(self.base64_input)
+        
+        controls_layout = QtWidgets.QHBoxLayout()
+        self.base64_mode = QtWidgets.QComboBox()
+        self.base64_mode.addItems(["Text", "Hex"])
+        controls_layout.addWidget(self.base64_mode)
+        
+        btn_encode = QtWidgets.QPushButton("Encode")
+        btn_encode.clicked.connect(self.run_base64_encode)
+        controls_layout.addWidget(btn_encode)
+        
+        btn_decode = QtWidgets.QPushButton("Decode")
+        btn_decode.clicked.connect(self.run_base64_decode)
+        controls_layout.addWidget(btn_decode)
+        layout.addLayout(controls_layout)
+        
+        layout.addWidget(QtWidgets.QLabel("<b>Output</b>"))
+        self.base64_output = QtWidgets.QTextEdit()
+        self.base64_output.setReadOnly(True)
+        self.base64_output.setFont(QtGui.QFont("Consolas", 10))
+        layout.addWidget(self.base64_output)
+        
+        tabs.addTab(widget, "Base64")
+
     def _create_excluded_rules_tab(self, tabs):
-        """Create the tab for managing excluded YARA rules."""
         self.excluded_rules_widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(self.excluded_rules_widget)
 
@@ -1314,34 +2838,49 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         layout.addLayout(btn_layout)
 
         tabs.addTab(self.excluded_rules_widget, "Excluded Rules")
+
+    def _create_task_manager_tab(self, tabs):
+        task_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(task_widget)
         
-    def _create_hex_view(self, parent_layout):
-        """Create the hex view panes and controls."""
-        hex_controls = QtWidgets.QHBoxLayout()
-        hex_controls.addWidget(QtWidgets.QLabel("Context:"))
+        self.task_table = QtWidgets.QTableWidget()
+        self.task_table.setColumnCount(3)
+        self.task_table.setHorizontalHeaderLabels(["ID", "Task", "Status"])
+        self.task_table.horizontalHeader().setStretchLastSection(True)
+        self.task_table.setColumnWidth(0, 40)
+        self.task_table.setColumnWidth(1, 250)
+        
+        layout.addWidget(self.task_table)
+        tabs.addTab(task_widget, "Task Manager")
+        
+    def _create_unified_views(self, parent_layout):
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("Context:"))
         self.spin_context = QtWidgets.QSpinBox()
         self.spin_context.setRange(MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE)
         self.spin_context.setValue(self.context)
         self.spin_context.valueChanged.connect(self.on_context_change)
-        hex_controls.addWidget(self.spin_context)
-        hex_controls.addStretch()
-        parent_layout.addLayout(hex_controls)
+        controls.addWidget(self.spin_context)
+        controls.addStretch()
+        parent_layout.addLayout(controls)
 
-        hex_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        view_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         
-        self.hex_a = QtWidgets.QTextEdit()
-        self.hex_b = QtWidgets.QTextEdit()
-        for he in (self.hex_a, self.hex_b):
-            he.setReadOnly(True)
-            he.setLineWrapMode(QtWidgets.QTextEdit.NoWrap)
-            f = QtGui.QFont("Consolas" if sys.platform == "win32" else "DejaVu Sans Mono", 11)
-            he.setFont(f)
-            he.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-            he.customContextMenuRequested.connect(self.on_hex_context_menu)
+        self.unified_view_a = QtWidgets.QTextEdit()
+        self.unified_view_b = QtWidgets.QTextEdit()
+
+        view_splitter.addWidget(self._create_view_pane("File A - Unified View", self.unified_view_a))
+        view_splitter.addWidget(self._create_view_pane("File B - Unified View", self.unified_view_b))
         
-        hex_split.addWidget(self._create_view_pane("File A Hex", self.hex_a))
-        hex_split.addWidget(self._create_view_pane("File B Hex", self.hex_b))
-        parent_layout.addWidget(hex_split, stretch=1)
+        for view in (self.unified_view_a, self.unified_view_b):
+            view.setReadOnly(True)
+            view.setLineWrapMode(QtWidgets.QTextEdit.NoWrap)
+            font = QtGui.QFont("Consolas" if sys.platform == "win32" else "DejaVu Sans Mono", 11)
+            view.setFont(font)
+            view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            view.customContextMenuRequested.connect(self.on_hex_context_menu)
+
+        parent_layout.addWidget(view_splitter, stretch=1)
 
         edit_row = QtWidgets.QHBoxLayout()
         edit_row.addWidget(QtWidgets.QLabel("Edit @ Offset (hex):"))
@@ -1358,23 +2897,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         edit_row.addWidget(btn_apply_edit)
         parent_layout.addLayout(edit_row)
 
-    def _create_asm_view(self, parent_layout):
-        """Create the disassembly view panes."""
-        asm_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        
-        self.asm_a = QtWidgets.QPlainTextEdit()
-        self.asm_b = QtWidgets.QPlainTextEdit()
-        for a in (self.asm_a, self.asm_b):
-            a.setReadOnly(True)
-            fa = QtGui.QFont("Consolas" if sys.platform == "win32" else "DejaVu Sans Mono", 10)
-            a.setFont(fa)
-        
-        asm_split.addWidget(self._create_view_pane("File A Assembly", self.asm_a))
-        asm_split.addWidget(self._create_view_pane("File B Assembly", self.asm_b))
-        parent_layout.addWidget(asm_split, stretch=1)
-
     def _create_view_pane(self, title, widget):
-        """Helper to create a titled pane for a view widget."""
         pane = QtWidgets.QGroupBox(title)
         layout = QtWidgets.QVBoxLayout(pane)
         layout.setContentsMargins(2, 8, 2, 2)
@@ -1382,7 +2905,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         return pane
 
     def _create_status_bar(self):
-        """Create the bottom status bar."""
         self.status_bar = self.statusBar()
         self.lbl_status = QtWidgets.QLabel("Ready")
         self.status_bar.addWidget(self.lbl_status)
@@ -1420,73 +2942,33 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
 
     def get_light_theme_style(self):
             return """
-                QMainWindow, QWidget { 
-                    background-color: #F0F0F0; 
-                    color: #000000; /* Sets default text color to black */
-                }
-                QTextEdit, QPlainTextEdit, QTreeWidget { 
-                    background-color: #FFFFFF; 
-                    color: #000000; 
-                    border: 1px solid #CCCCCC; 
-                }
-                QListWidget { 
-                    background-color: #FFFFFF; 
-                    color: #000000; 
-                    border: 1px solid #CCCCCC; 
-                }
-                QPushButton { 
-                    background-color: #E1E1E1; 
-                    color: #000000; /* Explicitly set button text color */
-                    border: 1px solid #ADADAD; 
-                    padding: 5px; 
-                    border-radius: 2px; 
-                }
-                QPushButton:hover { 
-                    background-color: #E5F1FB; 
-                    border: 1px solid #0078D7; 
-                }
-                QPushButton:pressed { 
-                    background-color: #CCE4F7; 
-                }
-                QLabel, QGroupBox { 
-                    color: #000000; 
-                }
-                QGroupBox { 
-                    border: 1px solid #CCCCCC; 
-                    margin-top: 0.5em; 
-                }
-                QGroupBox::title { 
-                    subcontrol-origin: margin; 
-                    left: 10px; 
-                    padding: 0 3px 0 3px; 
-                }
-                QLineEdit, QSpinBox, QComboBox { 
-                    background-color: #FFFFFF; 
-                    color: #000000; 
-                    border: 1px solid #ADADAD; 
-                    padding: 2px; 
-                }
-                QTabWidget::pane { 
-                    border: 1px solid #CCCCCC; 
-                }
-                QTabBar::tab { 
-                    background: #E1E1E1; 
-                    color: #000000; /* Explicitly set tab text color */
-                    padding: 8px; 
-                }
-                QTabBar::tab:selected { 
-                    background: #FFFFFF; 
-                }
-                QSplitter::handle { 
-                    background: #CCCCCC; 
-                }
+                QMainWindow, QWidget { background-color: #F0F0F0; color: #000000; }
+                QTextEdit, QPlainTextEdit, QTreeWidget, QGraphicsView { background-color: #FFFFFF; color: #000000; border: 1px solid #CCCCCC; }
+                QListWidget { background-color: #FFFFFF; color: #000000; border: 1px solid #CCCCCC; }
+                QTableWidget { background-color: #FFFFFF; color: #000000; border: 1px solid #CCCCCC; gridline-color: #DDDDDD; }
+                QTableWidget::item { padding: 3px; }
+                QHeaderView::section { background-color: #F0F0F0; padding: 4px; border: 1px solid #CCCCCC; }
+                QPushButton { background-color: #E1E1E1; color: #000000; border: 1px solid #ADADAD; padding: 5px; border-radius: 2px; }
+                QPushButton:hover { background-color: #E5F1FB; border: 1px solid #0078D7; }
+                QPushButton:pressed { background-color: #CCE4F7; }
+                QLabel, QGroupBox { color: #000000; }
+                QGroupBox { border: 1px solid #CCCCCC; margin-top: 0.5em; }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }
+                QLineEdit, QSpinBox, QComboBox { background-color: #FFFFFF; color: #000000; border: 1px solid #ADADAD; padding: 2px; }
+                QTabWidget::pane { border: 1px solid #CCCCCC; }
+                QTabBar::tab { background: #E1E1E1; color: #000000; padding: 8px; }
+                QTabBar::tab:selected { background: #FFFFFF; }
+                QSplitter::handle { background: #CCCCCC; }
             """
 
     def get_dark_theme_style(self):
         return """
             QMainWindow, QWidget { background-color: #2D2D30; color: #F1F1F1; }
-            QTextEdit, QPlainTextEdit, QTreeWidget { background-color: #1E1E1E; color: #D4D4D4; border: 1px solid #3E3E42; }
+            QTextEdit, QPlainTextEdit, QTreeWidget, QGraphicsView { background-color: #1E1E1E; color: #D4D4D4; border: 1px solid #3E3E42; }
             QListWidget { background-color: #252526; color: #CCCCCC; border: 1px solid #3E3E42; }
+            QTableWidget { background-color: #252526; color: #CCCCCC; border: 1px solid #3E3E42; gridline-color: #3E3E42; }
+            QTableWidget::item { padding: 3px; }
+            QHeaderView::section { background-color: #3E3E42; padding: 4px; border: 1px solid #555555; }
             QPushButton { background-color: #3E3E42; border: 1px solid #555555; padding: 5px; border-radius: 2px; }
             QPushButton:hover { background-color: #4F4F53; }
             QPushButton:pressed { background-color: #007ACC; }
@@ -1540,17 +3022,29 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
                 self.file_a_path = path
                 self.file_a_data = bytearray(data)
                 self.pe_features_a = None
+                self.matches_a = []
             else:
                 self.file_b_path = path
                 self.file_b_data = bytearray(data)
                 self.pe_features_b = None
+                self.matches_b = []
             
+            self.diff_hunks = [] 
+            self.capa_matches = [m for m in self.capa_matches if m[0] != which]
+            self._build_yara_index()
+
             self.lbl_status.setText(f"Loaded {which}: {os.path.basename(path)} ({len(data)} bytes)")
-            self._refresh_all_views()
+            
+            # Run feature extraction automatically for call graph
+            self.run_pe_feature_extraction(which=which, silent=True)
+            self._refresh_lists_and_views()
+            self.render_region(center=0)
+            self.update_roadmap()
+
 
         except Exception as e:
             msg = f"Error loading File {which}: {e}"
-            logging.error(msg)
+            logging.error(msg, exc_info=True)
             if not silent:
                 QtWidgets.QMessageBox.critical(self, f"Load Error", msg)
     
@@ -1602,12 +3096,9 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             yara_x.compile(rules_text)
             QtWidgets.QMessageBox.information(self, "YARA Valid", "The current YARA rules compiled successfully.")
         except yara_x.CompileError as e:
-            # yara-x compile errors can be quite verbose and structured. 
-            # Let's format it nicely for the message box.
             error_message = f"YARA Compile Error:\n\n{e}"
             QtWidgets.QMessageBox.critical(self, "YARA Compile Error", error_message)
         except Exception as e:
-            # Catch any other unexpected errors
             QtWidgets.QMessageBox.critical(self, "Validation Error", f"An unexpected error occurred: {e}")
 
     def run_yargen_from_gui(self):
@@ -1625,16 +3116,13 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         command.extend(["-m", malware_path])
         
         output_file = self.yargen_output_file.text()
-        if output_file:
-            command.extend(["-o", output_file])
+        if output_file: command.extend(["-o", output_file])
             
         author = self.yargen_author.text()
-        if author:
-            command.extend(["-a", author])
+        if author: command.extend(["-a", author])
             
         reference = self.yargen_reference.text()
-        if reference:
-            command.extend(["-r", reference])
+        if reference: command.extend(["-r", reference])
 
         if self.yargen_opcodes.isChecked(): command.append("--opcodes")
         if self.yargen_meaningful.isChecked(): command.append("--meaningful-words-only")
@@ -1642,7 +3130,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         if self.yargen_nofilesize.isChecked(): command.append("--nofilesize")
         if self.yargen_nosimple.isChecked(): command.append("--nosimple")
 
-        self.run_generic_subprocess(command, self.yargen_console)
+        self.run_generic_subprocess(command, self.yargen_console, "Run yarGen")
 
     def update_yargen_db(self):
         yar_gen_path = os.path.join(script_dir, "yarGen.py")
@@ -1650,94 +3138,97 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "yarGen Not Found", "Could not find yarGen.py in the script directory.")
             return
         command = [sys.executable, yar_gen_path, "--update"]
-        self.run_generic_subprocess(command, self.yargen_console)
+        self.run_generic_subprocess(command, self.yargen_console, "Update yarGen DB")
 
-    def run_generic_subprocess(self, command, output_widget, stdin_data=None):
+    def run_generic_subprocess(self, command, output_widget, task_name, stdin_data=None):
         output_widget.clear()
-        self.lbl_status.setText(f"Running: {' '.join(command)}")
+        task_id = self.add_task_to_manager(task_name)
 
-        def bg_task():
-            try:
-                startupinfo = None
-                if os.name == 'nt':
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        def task(progress_callback, console_output_callback):
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            process = subprocess.Popen(
+                command, 
+                stdin=subprocess.PIPE if stdin_data else None,
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True, 
+                encoding='utf-8', 
+                errors='ignore',
+                startupinfo=startupinfo
+            )
+            
+            if stdin_data:
+                stdout_data, _ = process.communicate(input=stdin_data)
+                console_output_callback.emit(stdout_data.strip())
+            else:
+                for output in iter(process.stdout.readline, ''):
+                    console_output_callback.emit(output.strip())
+            
+            return process.wait()
 
-                process = subprocess.Popen(
-                    command, 
-                    stdin=subprocess.PIPE if stdin_data else None,
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.STDOUT, 
-                    text=True, 
-                    encoding='utf-8', 
-                    errors='ignore',
-                    startupinfo=startupinfo
-                )
-                
-                if stdin_data:
-                    stdout_data, _ = process.communicate(input=stdin_data)
-                    QtCore.QMetaObject.invokeMethod(output_widget, "setPlainText", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, stdout_data.strip()))
-                else:
-                    while True:
-                        output = process.stdout.readline()
-                        if output == '' and process.poll() is not None:
-                            break
-                        if output:
-                            QtCore.QMetaObject.invokeMethod(output_widget, "appendPlainText", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, output.strip()))
-                
-                return_code = process.poll()
-                if return_code == 0:
-                    self.lbl_status.setText("Command finished successfully.")
-                else:
-                    self.lbl_status.setText(f"Command failed with exit code {return_code}.")
-
-            except Exception as e:
-                self.lbl_status.setText(f"Error executing command: {e}")
-
-        threading.Thread(target=bg_task, daemon=True).start()
-
+        worker = Worker(task)
+        worker.signals.console_output.connect(output_widget.appendPlainText)
+        worker.signals.result.connect(lambda code: self.update_task_in_manager(task_id, f"Finished with exit code {code}."))
+        worker.signals.error.connect(lambda err: self.update_task_in_manager(task_id, f"Error: {err[1]}"))
+        self.threadpool.start(worker)
 
     # --- Analysis and Scanning ---
     def scan_yara_only(self):
         if not self.yara_path:
             QtWidgets.QMessageBox.warning(self, "No YARA", "Load a YARA rule file first.")
             return
-        self.lbl_status.setText("Scanning with YARA...")
         
-        def bg_task():
-            try:
-                self.matches_a = collect_yara_matches(self.yara_path, bytes(self.file_a_data), self.excluded_rules) if self.file_a_data else []
-                self.matches_b = collect_yara_matches(self.yara_path, bytes(self.file_b_data), self.excluded_rules) if self.file_b_data else []
-                self.diff_hunks = []
-                self._build_yara_index()
-                QtCore.QMetaObject.invokeMethod(self, "_refresh_lists_and_views", QtCore.Qt.QueuedConnection)
-                self.lbl_status.setText("YARA scan complete.")
-            except Exception as e:
-                QtCore.QMetaObject.invokeMethod(self.lbl_status, "setText", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, f"YARA Error: {e}"))
+        task_id = self.add_task_to_manager("YARA Scan")
+        
+        def task(progress_callback, console_output_callback):
+            matches_a = collect_yara_matches(self.yara_path, bytes(self.file_a_data), self.excluded_rules) if self.file_a_data else []
+            matches_b = collect_yara_matches(self.yara_path, bytes(self.file_b_data), self.excluded_rules) if self.file_b_data else []
+            return {"matches_a": matches_a, "matches_b": matches_b}
 
-        threading.Thread(target=bg_task, daemon=True).start()
+        worker = Worker(task)
+        worker.signals.result.connect(lambda result: self.on_yara_scan_finished(result, task_id))
+        worker.signals.error.connect(lambda err: self.update_task_in_manager(task_id, f"Error: {err[1]}"))
+        self.threadpool.start(worker)
+
+    def on_yara_scan_finished(self, result, task_id):
+        self.matches_a = result["matches_a"]
+        self.matches_b = result["matches_b"]
+        self.diff_hunks = []
+        self._build_yara_index()
+        self._refresh_lists_and_views()
+        self.update_task_in_manager(task_id, "Complete")
 
     def scan_yara_and_diff(self):
         if self.file_a_data is None or self.file_b_data is None:
             QtWidgets.QMessageBox.warning(self, "Missing Files", "Load both File A and File B to run a diff.")
             return
-        self.lbl_status.setText("Scanning YARA and computing diffs...")
 
-        def bg_task():
-            try:
-                self.matches_a = collect_yara_matches(self.yara_path, bytes(self.file_a_data), self.excluded_rules) if self.yara_path else []
-                self.matches_b = collect_yara_matches(self.yara_path, bytes(self.file_b_data), self.excluded_rules) if self.yara_path else []
-                self.diff_hunks = compute_diff_hunks(bytes(self.file_a_data), bytes(self.file_b_data))
-                self._build_yara_index()
-                QtCore.QMetaObject.invokeMethod(self, "_refresh_lists_and_views", QtCore.Qt.QueuedConnection)
-                self.lbl_status.setText("Scan and diff complete.")
-            except Exception as e:
-                 QtCore.QMetaObject.invokeMethod(self.lbl_status, "setText", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, f"Scan/Diff Error: {e}"))
+        task_id = self.add_task_to_manager("YARA Scan + Diff")
 
-        threading.Thread(target=bg_task, daemon=True).start()
+        def task(progress_callback, console_output_callback):
+            matches_a = collect_yara_matches(self.yara_path, bytes(self.file_a_data), self.excluded_rules) if self.yara_path else []
+            matches_b = collect_yara_matches(self.yara_path, bytes(self.file_b_data), self.excluded_rules) if self.yara_path else []
+            diff_hunks = compute_diff_hunks(bytes(self.file_a_data), bytes(self.file_b_data))
+            return {"matches_a": matches_a, "matches_b": matches_b, "diff_hunks": diff_hunks}
+        
+        worker = Worker(task)
+        worker.signals.result.connect(lambda result: self.on_yara_diff_finished(result, task_id))
+        worker.signals.error.connect(lambda err: self.update_task_in_manager(task_id, f"Error: {err[1]}"))
+        self.threadpool.start(worker)
+
+    def on_yara_diff_finished(self, result, task_id):
+        self.matches_a = result["matches_a"]
+        self.matches_b = result["matches_b"]
+        self.diff_hunks = result["diff_hunks"]
+        self._build_yara_index()
+        self._refresh_lists_and_views()
+        self.update_task_in_manager(task_id, "Complete")
 
     def _build_yara_index(self):
-        """Group YARA matches by rule and identifier."""
         idx = {}
         all_matches = self.matches_a + self.matches_b
         is_a_map = {id(m): True for m in self.matches_a}
@@ -1756,7 +3247,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _refresh_lists_and_views(self):
-        """Update the UI lists (hunks, YARA matches) and refresh views."""
         self.hunk_list.clear()
         for i, h in enumerate(self.diff_hunks):
             off, ln = h['start'], h['length']
@@ -1783,36 +3273,42 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
 
     # --- Rendering and Views ---
     def _refresh_all_views(self):
-        """Re-render all data views (hex, asm) based on current state."""
         center = 0
-        if self.matches_a:
-            center = self.matches_a[0]['offset']
-        elif self.matches_b:
-            center = self.matches_b[0]['offset']
+        current_row = self.yara_list.currentRow()
+        if current_row >= 0 and current_row < len(self._yara_keys):
+            key = self._yara_keys[current_row]
+            offs = self.yara_index.get(key, {})
+            a_offs = offs.get('a_offsets', [])
+            b_offs = offs.get('b_offsets', [])
+            if a_offs:
+                center = a_offs[0]
+            elif b_offs:
+                center = b_offs[0]
+        else:
+            current_row = self.hunk_list.currentRow()
+            if current_row >= 0 and current_row < len(self.diff_hunks):
+                center = self.diff_hunks[current_row]['start']
+        
+        self.current_center_offset = center
         self.render_region(center=center)
+        
+        # Update only the currently visible tab
+        self.on_main_tab_changed(self.main_tabs.currentIndex())
 
     def render_region(self, center=0, yara_key=None):
-        """Render a specific region of the files centered around an offset."""
+        self.current_center_offset = center
         ctx = self.context
-        start = max(0, center - ctx)
+        start = max(0, center - ctx // 2)
         
-        self.render_hex_panes(start, yara_key)
-        self._disassemble_region(center)
+        self.unified_view_a.setHtml(self._render_unified_html(True, start, yara_key))
+        self.unified_view_b.setHtml(self._render_unified_html(False, start, yara_key))
 
-    def render_hex_panes(self, start_addr, yara_key=None):
-        """Render both hex panes."""
-        self.hex_a.setHtml(self._render_hex_html(True, start_addr, yara_key))
-        self.hex_b.setHtml(self._render_hex_html(False, start_addr, yara_key))
-
-    def _render_hex_html(self, is_left: bool, start: int, yara_key=None) -> str:
-        """Generates the HTML for a single hex pane."""
+    def _render_unified_html(self, is_left: bool, start: int, yara_key=None) -> str:
         data = self.file_a_data if is_left else self.file_b_data
+        if data is None: return ""
+
         other_data = self.file_b_data if is_left else self.file_a_data
         matches = self.matches_a if is_left else self.matches_b
-        
-        if data is None:
-            return ""
-
         yara_intervals = intervals_from_matches(matches)
         
         selected_yara_intervals = []
@@ -1823,99 +3319,379 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
                     length = m.get("length", 0)
                     selected_yara_intervals.append((offset, offset + length - 1))
 
+        # Theme colors
         bg_color = "#1E1E1E" if self.is_dark_theme else "#FFFFFF"
         text_color = "#D4D4D4" if self.is_dark_theme else "#000000"
         addr_color = "#6E6E6E" if self.is_dark_theme else "#888888"
+        hex_color = "#9CDCFE" if self.is_dark_theme else "#0000FF"
+        asm_color = "#DCDCAA" if self.is_dark_theme else "#8B008B"
+        comment_color = "#6A9955" if self.is_dark_theme else "#228B22"
         diff_bg = "#5A3800" if self.is_dark_theme else "#FFF2B2"
-        yar_bg = "#8B0000" if self.is_dark_theme else "#F26B6B"
-        yar_sel_bg = "#B22222" if self.is_dark_theme else "#B23B3B"
+        yar_bg = "#8B0000" if self.is_dark_theme else "#FFC0CB"
+        yar_sel_bg = "#B22222" if self.is_dark_theme else "#FFA07A"
+        border_color = "#3E3E42" if self.is_dark_theme else "#CCCCCC"
 
         css = f"""
         <style>
             body {{ background-color: {bg_color}; color: {text_color}; font-family: Consolas, 'DejaVu Sans Mono', monospace; font-size: 11px; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            td {{ vertical-align: top; padding: 0 5px; }}
+            .hex-pane {{ width: 55%; border-right: 1px solid {border_color}; }}
+            .asm-pane {{ width: 45%; }}
             .addr {{ color: {addr_color}; }}
+            .hex {{ color: {hex_color}; }}
+            .asm {{ color: {asm_color}; }}
+            .comment {{ color: {comment_color}; }}
             .diff {{ background-color: {diff_bg}; }}
-            .yar {{ background-color: {yar_bg}; color: white; }}
-            .yarsel {{ background-color: {yar_sel_bg}; color: white; font-weight: bold;}}
+            .yar {{ background-color: {yar_bg}; }}
+            .yarsel {{ background-color: {yar_sel_bg}; font-weight: bold;}}
         </style>
         """
+        html = ["<html><head>", css, "</head><body><pre><table>"]
         
-        html = ["<html><head>", css, "</head><body><pre>"]
-        
-        end = min(start + self.context * 2, len(data))
-        pos = start - (start % BYTES_PER_ROW)
+        end = min(start + self.context, len(data))
+        pos = start
+
+        cs = None
+        if CAPSTONE_AVAILABLE:
+            try:
+                cs = Cs(CS_ARCH_X86, CS_MODE_64)
+                cs.detail = True
+            except Exception as e:
+                logging.error(f"Capstone init error: {e}")
+                cs = None
 
         while pos < end:
-            addr = f"<span class='addr'>0x{pos:08X}:</span> "
-            hex_parts = []
-            ascii_parts = []
+            # --- Hex Pane ---
+            hex_pane_html = []
+            row_bytes = data[pos:pos+BYTES_PER_ROW]
+            if not row_bytes: break
 
-            for j in range(BYTES_PER_ROW):
-                offset = pos + j
-                if offset < len(data):
-                    byte_val = data[offset]
-                    char = chr(byte_val) if 32 <= byte_val <= 126 else '.'
-                    
-                    classes = []
-                    if self.show_diff and other_data and (offset >= len(other_data) or other_data[offset] != byte_val):
-                        classes.append("diff")
-                    if interval_contains(selected_yara_intervals, offset):
-                        classes.append("yarsel")
-                    elif interval_contains(yara_intervals, offset):
-                        classes.append("yar")
-                    
-                    class_attr = f' class="{" ".join(classes)}"' if classes else ""
-                    hex_parts.append(f"<span{class_attr}>{byte_val:02X}</span>")
-                    ascii_parts.append(f"<span{class_attr}>{char.replace('&', '&amp;').replace('<', '&lt;')}</span>")
-                else:
-                    hex_parts.append("  ")
-                    ascii_parts.append(" ")
-
+            hex_parts, ascii_parts = [], []
+            for j, byte_val in enumerate(row_bytes):
+                current_offset = pos + j
+                char = chr(byte_val) if 32 <= byte_val <= 126 else '.'
+                
+                classes = []
+                if self.show_diff and other_data and (current_offset >= len(other_data) or other_data[current_offset] != byte_val):
+                    classes.append("diff")
+                if interval_contains(selected_yara_intervals, current_offset):
+                    classes.append("yarsel")
+                elif interval_contains(yara_intervals, current_offset):
+                    classes.append("yar")
+                
+                class_attr = f' class="{" ".join(classes)}"' if classes else ""
+                hex_parts.append(f"<span{class_attr}>{byte_val:02X}</span>")
+                ascii_parts.append(f"<span{class_attr}>{char.replace('&', '&amp;').replace('<', '&lt;')}</span>")
+            
             hex_str = " ".join(hex_parts)
             ascii_str = "".join(ascii_parts)
-            html.append(f"{addr}{hex_str}  |{ascii_str}|")
+            hex_pane_html.append(f"<span class='addr'>0x{pos:08X}:</span> <span class='hex'>{hex_str:<{BYTES_PER_ROW*3-1}}</span>  |{ascii_str}|")
+
+            # --- Assembly Pane ---
+            asm_pane_html = []
+            insn = None
+            if cs:
+                chunk = bytes(data[pos:pos + 16]) # Disassemble from current line
+                if chunk:
+                    try:
+                        insn = next(cs.disasm(chunk, pos), None)
+                    except Exception:
+                        insn = None
+
+            if insn and insn.address == pos:
+                 asm_pane_html.append(f"<span class='asm'>{insn.mnemonic:<10} {insn.op_str}</span>")
+                 bytes_consumed = insn.size
+            else:
+                 asm_pane_html.append("&nbsp;") # Empty line if no instruction starts here
+                 bytes_consumed = BYTES_PER_ROW
+
+            # --- Combine into table row ---
+            html.append("<tr>")
+            html.append(f"<td class='hex-pane'>{'<br>'.join(hex_pane_html)}</td>")
+            html.append(f"<td class='asm-pane'>{'<br>'.join(asm_pane_html)}</td>")
+            html.append("</tr>")
+            
             pos += BYTES_PER_ROW
 
-        html.extend(["</pre></body></html>"])
+        html.extend(["</table></pre></body></html>"])
         return "\n".join(html)
 
-    def _disassemble_region(self, center: int):
-        if not CAPSTONE_AVAILABLE:
-            self.asm_a.setPlainText("Capstone library not found. Please install it.")
-            self.asm_b.setPlainText("pip install capstone")
+    def update_roadmap(self):
+        self.roadmap_scene.clear()
+        data = self.file_a_data # For now, roadmap is only for File A
+        if not data:
             return
 
-        size = 256
-        start = max(0, center - size // 2)
+        file_size = len(data)
+        view_width = self.roadmap_view.width() - 20 # Leave some margin
         
+        # Determine block size and layout
+        if file_size == 0: return
+        block_size = max(1, file_size // 10000) # Aim for around 10k blocks
+        blocks_per_row = 64
+        
+        num_blocks = math.ceil(file_size / block_size)
+        num_rows = math.ceil(num_blocks / blocks_per_row)
+        
+        rect_width = view_width / blocks_per_row
+        rect_height = rect_width
+        
+        self.roadmap_scene.setSceneRect(0, 0, view_width, num_rows * rect_height)
+
+        # Draw blocks
+        for i in range(num_blocks):
+            row = i // blocks_per_row
+            col = i % blocks_per_row
+            
+            offset = i * block_size
+            chunk = data[offset:offset+block_size]
+            if not chunk: continue
+
+            entropy = self.pe_extractor._calculate_entropy(chunk)
+            color_val = int(entropy * 32) # Scale entropy 0-8 to 0-255
+            color = QColor(color_val, color_val, color_val)
+
+            rect = QGraphicsRectItem(col * rect_width, row * rect_height, rect_width, rect_height)
+            rect.setBrush(QBrush(color))
+            rect.setPen(QPen(QtCore.Qt.NoPen))
+            rect.setToolTip(f"Offset: 0x{offset:X}\nEntropy: {entropy:.2f}")
+            self.roadmap_scene.addItem(rect)
+
+        # Draw PE section overlays if available
+        if self.pe_features_a and 'sections' in self.pe_features_a:
+            section_colors = [QColor(255,0,0,50), QColor(0,255,0,50), QColor(0,0,255,50), QColor(255,255,0,50)]
+            for i, section in enumerate(self.pe_features_a['sections']):
+                offset = section.get('pointer_to_raw_data', 0)
+                size = section.get('raw_size', 0)
+                name = section.get('name', '')
+
+                start_block = offset // block_size
+                end_block = (offset + size) // block_size
+                
+                start_row = start_block // blocks_per_row
+                start_col = start_block % blocks_per_row
+                end_row = end_block // blocks_per_row
+                end_col = end_block % blocks_per_row
+                
+                color = section_colors[i % len(section_colors)]
+                
+                # Draw rect covering the section
+                for r in range(start_row, end_row + 1):
+                    c_start = start_col if r == start_row else 0
+                    c_end = end_col if r == end_row else blocks_per_row - 1
+                    
+                    x = c_start * rect_width
+                    y = r * rect_height
+                    w = (c_end - c_start + 1) * rect_width
+                    h = rect_height
+                    
+                    sec_rect = QGraphicsRectItem(x, y, w, h)
+                    sec_rect.setBrush(QBrush(color))
+                    sec_rect.setPen(QPen(QtCore.Qt.NoPen))
+                    sec_rect.setToolTip(f"Section: {name}\nOffset: 0x{offset:X}\nSize: {size}")
+                    self.roadmap_scene.addItem(sec_rect)
+
+    def update_call_view(self):
+        self.call_view_tree.clear()
+        features = self.pe_features_a
+        if not features or 'imports' not in features:
+            return
+
+        for dll_import in features['imports']:
+            dll_name = dll_import.get('dll_name')
+            if not dll_name: continue
+            
+            dll_item = QtWidgets.QTreeWidgetItem([dll_name])
+            self.call_view_tree.addTopLevelItem(dll_item)
+
+            for func_import in dll_import.get('imports', []):
+                func_name = func_import.get('name')
+                if not func_name: continue
+                
+                address = func_import.get('address', 0)
+                func_item = QtWidgets.QTreeWidgetItem([func_name, f"0x{address:X}"])
+                dll_item.addChild(func_item)
+
+    def on_call_view_item_selected(self, item, column):
+        if item.childCount() == 0: # It's a function
+            address_str = item.text(1)
+            try:
+                address = int(address_str, 16)
+                self.render_region(center=address)
+                self.details.setPlainText(f"Function: {item.text(0)}\nAddress: {address_str}")
+            except ValueError:
+                pass
+
+    def filter_call_view(self, text):
+        """Filter the call view tree."""
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.call_view_tree)
+        while iterator.value():
+            item = iterator.value()
+            match = any(text.lower() in item.text(col).lower() for col in range(item.columnCount()))
+            item.setHidden(not match)
+            # If a child matches, show its parent
+            if match and item.parent():
+                item.parent().setHidden(False)
+            iterator += 1
+
+    def update_assembly_roadmap(self):
+        self.asm_roadmap_scene.clear()
+        data = self.file_a_data
+        if not (data and CAPSTONE_AVAILABLE):
+            self.asm_roadmap_scene.addText("Load a file to view Assembly Roadmap.")
+            return
+
+        start_offset = max(0, self.current_center_offset - self.context // 2)
+        end_offset = min(start_offset + self.context, len(data))
+        code = bytes(data[start_offset:end_offset])
+        
+        if not code:
+            self.asm_roadmap_scene.addText("No data in current view.")
+            return
+
         try:
             cs = Cs(CS_ARCH_X86, CS_MODE_64)
             cs.detail = True
+            instructions = list(cs.disasm(code, start_offset))
         except Exception as e:
-            self.asm_a.setPlainText(f"Capstone init error: {e}")
-            self.asm_b.setPlainText("")
+            self.asm_roadmap_scene.addText(f"Capstone Error: {e}")
             return
 
-        def disasm_into(pane, data, base_addr):
-            if not data:
-                pane.setPlainText("(no data)")
-                return
-            
-            out = []
-            try:
-                for insn in cs.disasm(bytes(data), base_addr):
-                    bh = binascii.hexlify(insn.bytes).decode().upper()
-                    out.append(f"0x{insn.address:08X}: {bh:<20} {insn.mnemonic} {insn.op_str}")
-                pane.setPlainText("\n".join(out))
-            except Exception as e:
-                pane.setPlainText(f"Disassembly error: {e}")
+        if not instructions:
+            self.asm_roadmap_scene.addText("No instructions disassembled in the current view.")
+            return
 
-        data_a = self.file_a_data[start : start + size] if self.file_a_data else b""
-        data_b = self.file_b_data[start : start + size] if self.file_b_data else b""
-        disasm_into(self.asm_a, data_a, start)
-        disasm_into(self.asm_b, data_b, start)
+        # 1. Find basic block boundaries
+        boundaries = {instructions[0].address}
+        for insn in instructions:
+            is_control_flow = insn.groups and (CS_GRP_JUMP in insn.groups or CS_GRP_CALL in insn.groups or CS_GRP_RET in insn.groups)
+            if is_control_flow:
+                boundaries.add(insn.address + insn.size)
+                if len(insn.operands) > 0 and insn.operands[0].type == CS_OP_IMM:
+                    target = insn.operands[0].value.imm
+                    if start_offset <= target <= end_offset:
+                        boundaries.add(target)
+
+        sorted_boundaries = sorted(list(boundaries))
+        
+        # 2. Create basic blocks
+        blocks = {}
+        addr_to_block_start = {}
+        for i in range(len(sorted_boundaries)):
+            start_addr = sorted_boundaries[i]
+            end_addr = sorted_boundaries[i+1] if i + 1 < len(sorted_boundaries) else end_offset
+            block_insns = [insn for insn in instructions if start_addr <= insn.address < end_addr]
+            if block_insns:
+                blocks[start_addr] = {'insns': block_insns, 'successors': []}
+                for insn in block_insns:
+                    addr_to_block_start[insn.address] = start_addr
+        
+        # 3. Find successors
+        for start_addr, block_data in blocks.items():
+            if not block_data['insns']: continue
+            last_insn = block_data['insns'][-1]
+            
+            is_unconditional_jump = last_insn.mnemonic == 'jmp' or (CS_GRP_RET in last_insn.groups)
+            if not is_unconditional_jump:
+                next_addr = last_insn.address + last_insn.size
+                if next_addr in addr_to_block_start:
+                    blocks[start_addr]['successors'].append(addr_to_block_start[next_addr])
+
+            if last_insn.groups and (CS_GRP_JUMP in last_insn.groups or CS_GRP_CALL in last_insn.groups):
+                if len(last_insn.operands) > 0 and last_insn.operands[0].type == CS_OP_IMM:
+                    target_addr = last_insn.operands[0].value.imm
+                    if target_addr in addr_to_block_start:
+                        blocks[start_addr]['successors'].append(addr_to_block_start[target_addr])
+
+        # 4. Layout and Draw Graph
+        nodes = {}
+        positions = {}
+        
+        all_addrs = set(blocks.keys())
+        non_root_addrs = {succ for start, data in blocks.items() for succ in data['successors'] if succ in all_addrs}
+        roots = sorted(list(all_addrs - non_root_addrs))
+        if not roots and all_addrs:
+            roots = [sorted(list(all_addrs))[0]]
+
+        level_counts = {}
+        queue = [(root, 0) for root in roots]
+        visited_bfs = set()
+
+        while queue:
+            addr, level = queue.pop(0)
+            if addr in visited_bfs: continue
+            visited_bfs.add(addr)
+
+            x_pos = level_counts.get(level, 0) * 350
+            y_pos = level * 150
+            positions[addr] = (x_pos, y_pos)
+            level_counts[level] = level_counts.get(level, 0) + 1
+
+            for succ_addr in sorted(blocks[addr]['successors']):
+                if succ_addr not in visited_bfs:
+                    queue.append((succ_addr, level + 1))
+
+        remaining_addrs = sorted(list(all_addrs - visited_bfs))
+        y_offset = (max(level_counts.keys()) + 2) * 150 if level_counts else 0
+        for i, addr in enumerate(remaining_addrs):
+            positions[addr] = (i * 350, y_offset)
+
+        for addr, block_data in blocks.items():
+            block_text = f"<b>loc_{addr:X}</b><br>" + "<br>".join(f"{i.mnemonic} {i.op_str}" for i in block_data['insns'])
+            
+            text_item = QGraphicsTextItem()
+            text_item.setHtml(f"<div style='background-color: #252526; color: #D4D4D4; padding: 5px; border-radius: 3px; border: 1px solid #3E3E42; font-family: Consolas; font-size: 10px;'>{block_text}</div>")
+            
+            if addr in positions:
+                x, y = positions[addr]
+                text_item.setPos(x, y)
+            
+            self.asm_roadmap_scene.addItem(text_item)
+            nodes[addr] = text_item
+
+        for start_addr, block_data in blocks.items():
+            source_node = nodes.get(start_addr)
+            if not source_node: continue
+            
+            for succ_addr in set(block_data['successors']):
+                dest_node = nodes.get(succ_addr)
+                if not dest_node: continue
+                
+                p1 = source_node.sceneBoundingRect().center()
+                p2 = dest_node.sceneBoundingRect().center()
+                
+                line = Arrow(p1, p2)
+                
+                last_insn = block_data['insns'][-1]
+                pen = QPen(QColor("gray"), 1.5)
+                if last_insn.mnemonic == 'call':
+                    pen.setColor(QColor("#569CD6")) # Blue
+                elif last_insn.mnemonic.startswith('j') and not last_insn.mnemonic == 'jmp':
+                    if succ_addr != (last_insn.address + last_insn.size):
+                         pen.setColor(QColor("#6A9955")) # Green for jump taken
+                    else:
+                         pen.setColor(QColor("#D16969")) # Red for fall-through
+                elif last_insn.mnemonic == 'jmp':
+                    pen.setColor(QColor("#C586C0")) # Purple
+                
+                line.setPen(pen)
+                line.setZValue(-1)
+                self.asm_roadmap_scene.addItem(line)
+
 
     # --- Event Handlers and Slots ---
+    @QtCore.Slot(int)
+    def on_main_tab_changed(self, index):
+        """Called when the user switches main tabs to update the view."""
+        tab_text = self.main_tabs.tabText(index)
+        if tab_text == "File Roadmap":
+            self.update_roadmap()
+        elif tab_text == "Call View":
+            self.update_call_view()
+        elif tab_text == "Assembly Roadmap":
+            self.update_assembly_roadmap()
+
     def on_context_change(self, value):
         self.context = value
         self._refresh_all_views()
@@ -1934,7 +3710,14 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             self._show_yara_details(key)
             
             offs = self.yara_index.get(key, {})
-            center = offs.get('a_offsets', [offs.get('b_offsets', [0])[0]])[0]
+            a_offs = offs.get('a_offsets', [])
+            b_offs = offs.get('b_offsets', [])
+            center = 0
+            if a_offs:
+                center = a_offs[0]
+            elif b_offs:
+                center = b_offs[0]
+            
             self.render_region(center=center, yara_key=key)
             
     def on_select_capa_match(self):
@@ -1951,7 +3734,30 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu()
         menu.addAction("Copy Displayed Text", lambda: QtWidgets.QApplication.clipboard().setText(sender.toPlainText()))
         menu.addAction("Edit Bytes at Offset...", self.open_edit_dialog)
-        menu.exec_(sender.mapToGlobal(pos))
+        menu.addSeparator()
+        menu.addAction("Go to Assembly Roadmap", self.go_to_assembly_roadmap)
+        menu.exec(sender.mapToGlobal(pos))
+
+    def go_to_assembly_roadmap(self):
+        for i in range(self.main_tabs.count()):
+            if self.main_tabs.tabText(i) == "Assembly Roadmap":
+                self.main_tabs.setCurrentIndex(i)
+                break
+
+    def on_graph_context_menu(self, pos):
+        menu = QtWidgets.QMenu()
+        
+        unified_action = menu.addAction("Unified View")
+        focused_action = menu.addAction("Focused View")
+        
+        action = menu.exec(self.graph_view.mapToGlobal(pos))
+        
+        if action == unified_action:
+            self.graph_view_mode = "unified"
+            self.update_call_graph()
+        elif action == focused_action:
+            self.graph_view_mode = "focused"
+            self.update_call_graph()
 
     def open_edit_dialog(self):
         dlg = QtWidgets.QDialog(self)
@@ -2026,64 +3832,75 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             return
         
         capa_exe = self.capa_path_edit.text().strip()
-        self.lbl_status.setText(f"Running CAPA on File {which}...")
+        task_id = self.add_task_to_manager(f"CAPA analysis on File {which}")
         
-        def bg_task():
-            res_path = run_capa_analysis(path, capa_exe)
-            if res_path:
-                try:
-                    with open(res_path, 'r', encoding='utf-8') as f:
-                        results = f.read()
-                    
-                    parsed_matches = parse_capa_output(results)
-                    self.capa_matches = [m for m in self.capa_matches if m[0] != which]
-                    self.capa_matches.extend([(which, match) for match in parsed_matches])
-                    
-                    QtCore.QMetaObject.invokeMethod(self.capa_editor, "setPlainText", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, results))
-                    QtCore.QMetaObject.invokeMethod(self, "_refresh_lists_and_views", QtCore.Qt.QueuedConnection)
-                    self.lbl_status.setText(f"CAPA analysis for {which} complete.")
-                except Exception as e:
-                    self.lbl_status.setText(f"Error reading CAPA results: {e}")
-            else:
-                self.lbl_status.setText(f"CAPA analysis for {which} failed.")
+        worker = Worker(run_capa_analysis, path, capa_exe)
+        worker.signals.result.connect(lambda res_path: self.on_capa_finished(which, res_path, task_id))
+        worker.signals.error.connect(lambda err: self.update_task_in_manager(task_id, f"Error: {err[1]}"))
+        self.threadpool.start(worker)
 
-        threading.Thread(target=bg_task, daemon=True).start()
+    def on_capa_finished(self, which, res_path, task_id):
+        if res_path:
+            try:
+                with open(res_path, 'r', encoding='utf-8') as f:
+                    results = f.read()
+                
+                parsed_matches = parse_capa_output(results)
+                self.capa_matches = [m for m in self.capa_matches if m[0] != which]
+                self.capa_matches.extend([(which, match) for match in parsed_matches])
+                
+                self.capa_editor.setPlainText(results)
+                self._refresh_lists_and_views()
+                self.update_task_in_manager(task_id, "Complete")
+            except Exception as e:
+                self.update_task_in_manager(task_id, f"Error reading results: {e}")
+        else:
+            self.update_task_in_manager(task_id, "Failed")
 
-    def run_pe_feature_extraction(self):
-        """Extracts and displays PE features for the selected file."""
-        which_str, ok = QtWidgets.QInputDialog.getItem(self, "Select Target", "Extract features for:", ["File A", "File B"], 0, False)
-        if not ok:
-            return
+    def run_pe_feature_extraction(self, which=None, silent=False):
+        target_which = which
+        if not target_which:
+            which_str, ok = QtWidgets.QInputDialog.getItem(self, "Select Target", "Extract features for:", ["File A", "File B"], 0, False)
+            if not ok: return
+            target_which = 'A' if which_str == "File A" else 'B'
         
-        which = 'A' if which_str == "File A" else 'B'
-        path = self.file_a_path if which == 'A' else self.file_b_path
+        path = self.file_a_path if target_which == 'A' else self.file_b_path
         
         if not path:
-            QtWidgets.QMessageBox.warning(self, "No File", f"File {which} is not loaded.")
+            if not silent:
+                QtWidgets.QMessageBox.warning(self, "No File", f"File {target_which} is not loaded.")
             return
-            
-        self.lbl_status.setText(f"Extracting PE features for File {which}...")
         
-        def bg_task():
-            features = self.pe_extractor.extract_numeric_features(path)
-            if which == 'A':
-                self.pe_features_a = features
-            else:
-                self.pe_features_b = features
-            
-            QtCore.QMetaObject.invokeMethod(self, "display_pe_features", QtCore.Qt.QueuedConnection)
-            self.lbl_status.setText(f"PE feature extraction for File {which} complete.")
+        task_id = self.add_task_to_manager(f"Extracting PE features for File {target_which}")
+        
+        # Define a wrapper task to avoid passing unwanted arguments to the extractor
+        def task(progress_callback, console_output_callback):
+            return self.pe_extractor.extract_numeric_features(path)
 
-        threading.Thread(target=bg_task, daemon=True).start()
+        worker = Worker(task)
+        worker.signals.result.connect(lambda features: self.on_pe_features_finished(target_which, features, task_id))
+        worker.signals.error.connect(lambda err: self.update_task_in_manager(task_id, f"Error: {err[1]}"))
+        self.threadpool.start(worker)
+
+    def on_pe_features_finished(self, which, features, task_id):
+        if "error" in features:
+            self.update_task_in_manager(task_id, f"Error: {features['error']}")
+            return
+
+        if which == 'A':
+            self.pe_features_a = features
+        else:
+            self.pe_features_b = features
+        
+        self.display_pe_features()
+        self.update_task_in_manager(task_id, "Complete")
         
     def browse_for_clamav_db(self):
-        """Opens a file dialog to select a ClamAV database file."""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select ClamAV Database", filter="ClamAV DB (*.cvd *.cld *.ndb *.hdb *.ldb);;All files (*)")
         if path:
             self.clamav_db_path.setText(path)
 
     def on_clamav_command_change(self, text):
-        """Shows or hides the argument input based on the selected command."""
         if "--find-sigs" in text:
             self.clamav_command_arg_label.show()
             self.clamav_command_arg.show()
@@ -2092,7 +3909,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             self.clamav_command_arg.hide()
 
     def run_sigtool_from_gui(self):
-        """Constructs and runs the sigtool command for database inspection."""
         sigtool_path = os.path.join(script_dir, "clamav", "sigtool.exe")
         if not os.path.exists(sigtool_path):
             QtWidgets.QMessageBox.warning(self, "SigTool Not Found", f"Could not find sigtool.exe at: {sigtool_path}")
@@ -2105,6 +3921,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
 
         command_str = self.clamav_command_select.currentText()
         command = [sigtool_path]
+        task_name = f"SigTool {command_str.split(' ')[0]}"
 
         if "--info" in command_str:
             command.extend(["--info", db_path])
@@ -2119,10 +3936,9 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
                 return
             command.extend([f"--find-sigs={arg}", db_path])
         
-        self.run_generic_subprocess(command, self.clamav_console)
+        self.run_generic_subprocess(command, self.clamav_console, task_name)
 
     def run_sigtool_decode(self):
-        """Runs sigtool --decode-sigs with input from the text box."""
         sigtool_path = os.path.join(script_dir, "clamav", "sigtool.exe")
         if not os.path.exists(sigtool_path):
             QtWidgets.QMessageBox.warning(self, "SigTool Not Found", f"Could not find sigtool.exe at: {sigtool_path}")
@@ -2134,11 +3950,10 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             return
         
         command = [sigtool_path, "--decode-sigs"]
-        self.run_generic_subprocess(command, self.clamav_console, stdin_data=signatures_text)
+        self.run_generic_subprocess(command, self.clamav_console, "Decode Signatures", stdin_data=signatures_text)
 
     @QtCore.Slot()
     def display_pe_features(self):
-        """Updates the PE analysis UI elements with extracted data."""
         which_str = self.pe_file_selector.currentText()
         which = 'A' if which_str == "File A" else 'B'
         features = self.pe_features_a if which == 'A' else self.pe_features_b
@@ -2155,7 +3970,6 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             self.btn_generate_yara.setEnabled(False)
             return
 
-        # Display formatted JSON
         try:
             self.pe_features_output.setPlainText(json.dumps(features, indent=4))
             self.btn_generate_yara.setEnabled(True)
@@ -2163,61 +3977,41 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             self.pe_features_output.setPlainText(f"Error formatting features: {e}")
             self.btn_generate_yara.setEnabled(False)
 
-        # Populate resource tree
         self.resource_tree.clear()
         if features.get('resources'):
             for res in features['resources']:
-                item = QtWidgets.QTreeWidgetItem([
-                    str(res.get('type', 'N/A')),
-                    str(res.get('id', 'N/A')),
-                    str(res.get('lang', 'N/A')),
-                    str(res.get('size', 'N/A')),
-                    f"0x{res.get('offset', 0):X}"
-                ])
+                item = QtWidgets.QTreeWidgetItem([str(res.get(k, 'N/A')) for k in ['type_id', 'resource_id', 'lang_id', 'size']])
                 self.resource_tree.addTopLevelItem(item)
         
-        self.pe_file_selector.currentTextChanged.connect(self.display_pe_features)
-
+        self.update_roadmap()
+        self.update_call_view()
+        self.update_assembly_roadmap()
 
     def prepare_yargen_for_current_file(self):
-        """Pre-populates the yarGen GUI with the current PE file and switches to it."""
         which_str = self.pe_file_selector.currentText()
-        which = 'A' if which_str == "File A" else 'B'
-        path = self.file_a_path if which == 'A' else self.file_b_path
+        path = self.file_a_path if which_str == "File A" else self.file_b_path
 
         if not path:
-            QtWidgets.QMessageBox.warning(self, "No File", f"File {which} is not loaded or has no path.")
+            QtWidgets.QMessageBox.warning(self, "No File", f"File {which_str} is not loaded.")
             return
 
-        # Pre-populate the yarGen tab fields
         self.yargen_malware_path.setText(path)
         suggested_output = os.path.join(os.path.dirname(path), f"{Path(path).stem}_rules.yar")
         self.yargen_output_file.setText(suggested_output)
 
-        # Switch to the yarGen GUI tab
-        yargen_tab_index = -1
         for i in range(self.main_tabs.count()):
-            if self.main_tabs.widget(i) == self.yargen_widget:
-                 yargen_tab_index = i
+            if self.main_tabs.tabText(i) == "yarGen GUI":
+                 self.main_tabs.setCurrentIndex(i)
                  break
-
-        if yargen_tab_index != -1:
-            self.main_tabs.setCurrentIndex(yargen_tab_index)
-            self.lbl_status.setText(f"yarGen GUI is ready for {os.path.basename(path)}. Adjust settings and click 'Run yarGen'.")
-        else:
-            logging.error("Could not find the yarGen GUI tab.")
+        self.lbl_status.setText(f"yarGen GUI is ready for {os.path.basename(path)}.")
 
     def run_detectiteasy_scan(self):
-        """Runs DetectItEasy on the selected file."""
         which_str, ok = QtWidgets.QInputDialog.getItem(self, "Select Target", "Run DiE on:", ["File A", "File B"], 0, False)
-        if not ok:
-            return
+        if not ok: return
             
-        which = 'A' if which_str == "File A" else 'B'
-        path = self.file_a_path if which == 'A' else self.file_b_path
-
+        path = self.file_a_path if which_str == "File A" else self.file_b_path
         if not path:
-            QtWidgets.QMessageBox.warning(self, "No File", f"File {which} is not loaded.")
+            QtWidgets.QMessageBox.warning(self, "No File", f"File {which_str} is not loaded.")
             return
 
         die_path = os.path.join(script_dir, "detectiteasy", "diec.exe")
@@ -2226,11 +4020,9 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
              return
 
         command = [die_path, "-j", path]
-        self.run_generic_subprocess(command, self.die_output)
-
+        self.run_generic_subprocess(command, self.die_output, f"DetectItEasy on File {which_str[-1]}")
 
     def clear_all(self):
-        """Reset the application state."""
         self.file_a_path = self.file_b_path = self.yara_path = None
         self.file_a_data = self.file_b_data = None
         self.pe_features_a = self.pe_features_b = None
@@ -2239,15 +4031,12 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.diff_hunks = []
         self.yara_index = {}
         self._yara_keys = []
-        self.match_idx_a = self.match_idx_b = -1
         
         self.hunk_list.clear()
         self.yara_list.clear()
         self.capa_list.clear()
-        self.hex_a.clear()
-        self.hex_b.clear()
-        self.asm_a.clear()
-        self.asm_b.clear()
+        self.unified_view_a.clear()
+        self.unified_view_b.clear()
         self.details.clear()
         self.yara_editor.clear()
         self.capa_editor.clear()
@@ -2255,8 +4044,12 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.resource_tree.clear()
         self.die_output.clear()
         self.clamav_console.clear()
-        self.clamav_db_path.clear()
-        self.clamav_sig_input.clear()
+        self.base64_input.clear()
+        self.base64_output.clear()
+        self.roadmap_scene.clear()
+        self.call_view_tree.clear()
+        self.asm_roadmap_scene.clear()
+        self.task_table.setRowCount(0)
         self.btn_generate_yara.setEnabled(False)
         
         self.lbl_status.setText("Cleared All")
@@ -2280,20 +4073,17 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.details.setPlainText(text)
 
     def add_excluded_directory(self):
-        """Opens a dialog to select a directory of YARA rules to exclude."""
         dir_path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory to Exclude")
         if dir_path:
             self.excluded_rules_list.addItem(dir_path)
             self.load_excluded_rules()
 
     def remove_selected_excluded(self):
-        """Removes the selected directory from the excluded list."""
         for item in self.excluded_rules_list.selectedItems():
             self.excluded_rules_list.takeItem(self.excluded_rules_list.row(item))
         self.load_excluded_rules()
 
     def load_excluded_rules(self):
-        """Loads all YARA rule names from the excluded directories."""
         self.excluded_rules = set()
         if not os.path.exists(excluded_rules_dir):
             os.makedirs(excluded_rules_dir)
@@ -2307,13 +4097,192 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
                         try:
                             with open(rule_path, 'r', encoding='utf-8', errors='ignore') as f:
                                 content = f.read()
-                            # A simple regex to find rule names. This might not cover all edge cases.
                             rule_names = re.findall(r"rule\s+([a-zA-Z0-9_]+)", content)
                             self.excluded_rules.update(rule_names)
                         except Exception as e:
                             logging.error(f"Error reading excluded rule file {rule_path}: {e}")
         
         self.lbl_status.setText(f"Loaded {len(self.excluded_rules)} excluded YARA rules.")
+
+    def run_base64_encode(self):
+        input_text = self.base64_input.toPlainText()
+        if not input_text: return
+        
+        try:
+            if self.base64_mode.currentText() == "Hex":
+                input_bytes = binascii.unhexlify(input_text.replace(" ", ""))
+            else:
+                input_bytes = input_text.encode('utf-8')
+            
+            encoded_bytes = base64.b64encode(input_bytes)
+            self.base64_output.setPlainText(encoded_bytes.decode('ascii'))
+        except Exception as e:
+            self.base64_output.setPlainText(f"Error: {e}")
+
+    def run_base64_decode(self):
+        input_text = self.base64_input.toPlainText()
+        if not input_text: return
+        
+        try:
+            decoded_bytes = base64.b64decode(input_text)
+            
+            if self.base64_mode.currentText() == "Hex":
+                output_text = binascii.hexlify(decoded_bytes).decode('ascii')
+            else:
+                output_text = decoded_bytes.decode('utf-8', errors='replace')
+            
+            self.base64_output.setPlainText(output_text)
+        except Exception as e:
+            self.base64_output.setPlainText(f"Error: {e}")
+            
+    def filter_results(self, text):
+        """Filter the lists in the Scan Results tab."""
+        for i in range(self.hunk_list.count()):
+            item = self.hunk_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+            
+        for i in range(self.yara_list.count()):
+            item = self.yara_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+            
+        for i in range(self.capa_list.count()):
+            item = self.capa_list.item(i)
+            item.setHidden(text.lower() not in item.text().lower())
+
+    def filter_pe_analysis(self, text):
+        """Filter the PE Analysis tab content."""
+        iterator = QtWidgets.QTreeWidgetItemIterator(self.resource_tree)
+        while iterator.value():
+            item = iterator.value()
+            match = any(text.lower() in item.text(col).lower() for col in range(item.columnCount()))
+            item.setHidden(not match)
+            iterator += 1
+
+    def filter_editors(self, text):
+        """Search within the active editor."""
+        editor = None
+        current_tab_widget = self.main_tabs.currentWidget().findChild(QtWidgets.QTabWidget)
+        if current_tab_widget:
+            if current_tab_widget.currentWidget().objectName() == "YARA Editor":
+                 editor = self.yara_editor
+            elif current_tab_widget.currentWidget().objectName() == "CAPA Editor":
+                 editor = self.capa_editor
+        
+        if editor:
+            cursor = editor.textCursor()
+            cursor.setPosition(0)
+            editor.setTextCursor(cursor)
+            
+            extra_selections = []
+            if text:
+                color = QColor(Qt.yellow).lighter(160)
+                while editor.find(text):
+                    selection = QtWidgets.QTextEdit.ExtraSelection()
+                    selection.format.setBackground(color)
+                    selection.cursor = editor.textCursor()
+                    extra_selections.append(selection)
+            editor.setExtraSelections(extra_selections)
+
+    # --- Task Management ---
+    def add_task_to_manager(self, task_name: str) -> int:
+        self.task_counter += 1
+        task_id = self.task_counter
+        
+        row_position = self.task_table.rowCount()
+        self.task_table.insertRow(row_position)
+        
+        self.task_table.setItem(row_position, 0, QTableWidgetItem(str(task_id)))
+        self.task_table.setItem(row_position, 1, QTableWidgetItem(task_name))
+        self.task_table.setItem(row_position, 2, QTableWidgetItem("Running..."))
+        
+        return task_id
+
+    def update_task_in_manager(self, task_id: int, status: str):
+        for row in range(self.task_table.rowCount()):
+            if self.task_table.item(row, 0).text() == str(task_id):
+                self.task_table.setItem(row, 2, QTableWidgetItem(status))
+                break
+    
+    # --- Unpacker ---
+    def run_unpacker(self, which: str):
+        if not UNICORN_AVAILABLE:
+            QtWidgets.QMessageBox.critical(self, "Unicorn Engine Not Found", "Please install the Unicorn Engine to use this feature: pip install unicorn")
+            return
+
+        path = self.file_a_path if which == 'A' else self.file_b_path
+        if not path:
+            QtWidgets.QMessageBox.warning(self, "No File", f"File {which} is not loaded.")
+            return
+
+        task_id = self.add_task_to_manager(f"Unpacking File {which}")
+        self.unpacker_console.clear()
+
+        # in run_unpacker.task(...)
+        def task(progress_callback, console_output_callback):
+            unpacker = EnhancedUnicornUnpacker(path, console_output_callback)
+            res = unpacker.unpack()
+            if not res:
+                return {"ok": False, "msg": "Unpack failed"}
+
+            # Persist big payloads to disk BEFORE emitting the result
+            tmp_dir = os.path.join(os.getcwd(), "unpack_tmp")
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            unpacked_path = None
+            if res.get("unpacked_data"):
+                unpacked_path = os.path.join(tmp_dir, f"{Path(path).stem}_unpacked.bin")
+                with open(unpacked_path, "wb") as f:
+                    f.write(res["unpacked_data"])
+                # Free memory and avoid sending big bytes across the signal
+                res["unpacked_data"] = None
+
+            # (Optional) persist vmprotect decompressed sections too
+            ds = res.get("decompressed_sections") or {}
+            ds_paths = {}
+            for rva, data in ds.items():
+                outp = os.path.join(tmp_dir, f"{Path(path).stem}_vmp_{rva:08x}.bin")
+                with open(outp, "wb") as f:
+                    f.write(data)
+                ds_paths[rva] = outp
+            res["decompressed_section_paths"] = ds_paths
+
+            res["unpacked_path"] = unpacked_path
+            res["ok"] = True
+            # remove heavy objects that don't need to cross the signal
+            res.pop("original_pe", None)
+            return res
+
+        worker = Worker(task)
+        worker.signals.console_output.connect(self.unpacker_console.appendPlainText)
+        worker.signals.result.connect(lambda result: self.on_unpacker_finished(which, result, task_id))
+        worker.signals.error.connect(lambda err: self.update_task_in_manager(task_id, f"Error: {err[1]}"))
+        self.threadpool.start(worker)
+
+    def on_unpack_clicked(self):
+        unpacker = EnhancedUnicornUnpacker(file_path, console_output_callback=self.append_console)
+        worker = Worker(unpacker.unpack)   # run in background
+        worker.signals.result.connect(self.on_unpack_finished)
+        worker.signals.console_output.connect(self.append_console)
+        self.threadpool.start(worker)
+
+    def save_unpacked_file(self, which: str):
+        data = self.unpacked_data_a if which == 'A' else self.unpacked_data_b
+        original_path = self.file_a_path if which == 'A' else self.file_b_path
+
+        if not data:
+            QtWidgets.QMessageBox.warning(self, "No Data", f"No unpacked data available for File {which}.")
+            return
+
+        default_name = Path(original_path).stem + "_unpacked.bin"
+        save_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f"Save Unpacked File {which}", default_name)
+
+        if save_path:
+            try:
+                with open(save_path, 'wb') as f:
+                    f.write(data)
+                self.lbl_status.setText(f"Saved unpacked file to {save_path}")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Save Error", f"Could not save file: {e}")
 
 
 # --- Application Entry Point ---
