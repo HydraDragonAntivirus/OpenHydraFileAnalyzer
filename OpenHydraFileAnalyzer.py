@@ -3909,7 +3909,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
             self.clamav_command_arg.hide()
 
     def run_sigtool_from_gui(self):
-        sigtool_path = os.path.join(script_dir, "clamav", "sigtool.exe")
+        sigtool_path = os.path.join("C:\\Program Files" "clamav", "sigtool.exe")
         if not os.path.exists(sigtool_path):
             QtWidgets.QMessageBox.warning(self, "SigTool Not Found", f"Could not find sigtool.exe at: {sigtool_path}")
             return
@@ -3939,7 +3939,7 @@ class OpenHydraFileAnalyzer(QtWidgets.QMainWindow):
         self.run_generic_subprocess(command, self.clamav_console, task_name)
 
     def run_sigtool_decode(self):
-        sigtool_path = os.path.join(script_dir, "clamav", "sigtool.exe")
+        sigtool_path = os.path.join("C:\\Program Files\\" "clamav", "sigtool.exe")
         if not os.path.exists(sigtool_path):
             QtWidgets.QMessageBox.warning(self, "SigTool Not Found", f"Could not find sigtool.exe at: {sigtool_path}")
             return
